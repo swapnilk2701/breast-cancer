@@ -1,0 +1,41 @@
+project:
+  name: "Breast Cancer Mammography Denoising"
+  seed: 42
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  results_dir: "data/processed/results"
+
+data:
+  image_size: [256, 256]
+  supported_formats: [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]
+
+noise:
+  gaussian:
+    var: 0.01
+  sp:
+    amount: 0.05
+  speckle:
+    var: 0.04
+  mixed_poisson_gaussian:
+    gaussian_var: 0.01
+
+denoising:
+  median:
+    kernel_size: 5
+  gaussian:
+    kernel_size: [5, 5]
+    sigma: 0
+  wiener:
+    balance: 0.1
+  bilateral:
+    d: 9
+    sigma_color: 75
+    sigma_space: 75
+  non_local_means:
+    h: 10
+    template_window_size: 7
+    search_window_size: 21
+  adaptive_median:
+    s_max: 7

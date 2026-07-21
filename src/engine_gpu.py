@@ -1,5 +1,7 @@
 import os
 import pandas as pd
+import torch
+import numpy as np
 from src.utils import (
     load_config,
     save_image,
@@ -8,13 +10,27 @@ from src.utils import (
     display_sample_images
 )
 from src.data_loader import get_image_paths, load_dataset_generator
-from src.model import add_noise, apply_denoising
+from src.model_gpu import add_noise_gpu, apply_denoising_gpu
+
+def tensor_to_numpy(tensor):
+    """
+    Convert a GPU tensor to a 2D NumPy image.
+    """
+    img = tensor.detach().cpu().squeeze().numpy()
+    img = np.clip(img, 0.0, 1.0)
+    return img
 
 def run_pipeline(config_path="config/config.yaml", max_images=None):
     """
-    Runs the end-to-end mammography denoising pipeline.
+    Runs the end-to-end mammography denoising pipeline accelerated on GPU.
     """
     config = load_config(config_path)
+    
+    # Device configuration
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+    if device.type == "cuda":
+        print(f"GPU Device Name: {torch.cuda.get_device_name(0)}")
     
     # Extract paths
     raw_dir = config['paths']['raw_dir']
@@ -53,26 +69,40 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         image_name = item["image_name"]
         base_name = os.path.splitext(image_name)[0]
         
-        print(f"[{idx+1}/{len(image_items)}] Processing {image_name} (Class: {class_folder})")
+        print(f"[{idx+1}/{len(image_items)}] Processing {image_name} (Class: {class_folder}) on GPU")
+        
+        # Convert original image to PyTorch tensor and move to GPU
+        original_tensor = (
+    torch.from_numpy(original_img)
+    .float()
+    .unsqueeze(0)
+    .unsqueeze(0)
+    .to(device)
+)
         
         for noise_name in noise_types:
-            # Inject noise
-            noisy_img = add_noise(original_img, noise_name, config)
+            # Inject noise on GPU
+            noisy_tensor = add_noise_gpu(original_tensor, noise_name, config, device)
             
-            # Save noisy image
+            # Transfer noisy image to CPU (numpy) to save it
+            noisy_img = tensor_to_numpy(noisy_tensor)
+
             noisy_filename = f"{base_name}_{noise_name}_noisy.png"
             noisy_path = os.path.join(noisy_out_dir, noisy_filename)
+
             save_image(noisy_img, noisy_path)
             
             for method_name in denoising_methods:
-                # Apply denoising filter
-                denoised_img = apply_denoising(noisy_img, method_name, config)
+                # Apply denoising filter on GPU
+                denoised_tensor = apply_denoising_gpu(noisy_tensor, method_name, config)
                 
-                # Save denoised image
+                # Transfer denoised image to CPU (numpy) to save it
+                denoised_img = tensor_to_numpy(denoised_tensor)
+
                 denoised_filename = f"{base_name}_{noise_name}_{method_name}_denoised.png"
                 denoised_path = os.path.join(denoised_out_dir, denoised_filename)
+
                 save_image(denoised_img, denoised_path)
-                
                 # Compute metrics
                 metrics = calculate_metrics(original_img, noisy_img, denoised_img)
                 
@@ -155,7 +185,5 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         print(f"Sample visualization saved to: {sample_viz_path}")
 
 if __name__ == "__main__":
-    # Run on all images in the dataset
-    # run_pipeline(max_images=None)
+    # Run pipeline on GPU
     run_pipeline(max_images=10)
-

@@ -1,0 +1,15 @@
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+
+WORKDIR /app
+
+COPY requirements-gpu.txt .
+
+RUN pip install -r requirements-gpu.txt
+
+COPY config/ config/
+COPY src/ src/
+
+CMD ["python", "-m", "src.engine_gpu"]

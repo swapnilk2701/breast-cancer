@@ -1,6 +1,3 @@
-# Default Dockerfile (CPU version)
-# For specific CPU/GPU builds, see Dockerfile.cpu and Dockerfile.gpu
-
 FROM python:3.9-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -8,16 +5,20 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+# Install system dependencies required for OpenCV
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     libgl1-mesa-glx \
     libglib2.0-0 && \
     rm -rf /var/lib/apt/lists/*
 
+# Install python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy source code and config
 COPY config/ config/
 COPY src/ src/
 
+# Run CPU engine by default
 CMD ["python", "-m", "src.engine"]

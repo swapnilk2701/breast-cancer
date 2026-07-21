@@ -37,13 +37,18 @@ def read_and_preprocess_image(image_path, target_size=(256, 256)):
 
 def save_image(image_array, output_path):
     """
-    Saves a float64 [0,1] image array back to a file.
+    Saves a float image [0,1] as uint8 PNG.
     """
     try:
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        # Convert back to uint8 [0, 255] before saving with OpenCV
-        img_to_save = (np.clip(image_array, 0, 1) * 255).astype(np.uint8)
+
+        image_array = np.squeeze(image_array)
+        image_array = np.clip(image_array, 0.0, 1.0)
+
+        img_to_save = (image_array * 255).astype(np.uint8)
+
         cv2.imwrite(output_path, img_to_save)
+
     except Exception as e:
         print(f"Error saving image to {output_path}: {e}")
 

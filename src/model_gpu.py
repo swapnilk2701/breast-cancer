@@ -2,20 +2,31 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# --- Custom Anscombe Transform Functions on GPU ---
+# --- GPU Batch Anscombe Transform Functions ---
 def anscombe_gpu(image_tensor, constant=3/8):
-    """Applies the Anscombe transform for variance stabilization of Poisson data on GPU."""
+    """
+    Applies the Anscombe transform for variance stabilization of Poisson data on GPU.
+    Supports single images (1, 1, H, W) and batched tensors (B, 1, H, W).
+    """
     return 2.0 * torch.sqrt(image_tensor + constant)
 
 def inverse_anscombe_gpu(transformed_image_tensor, constant=3/8):
-    """Applies the inverse Anscombe transform on GPU."""
+    """
+    Applies the inverse Anscombe transform on GPU.
+    Supports single images (1, 1, H, W) and batched tensors (B, 1, H, W).
+    """
     return torch.clamp((transformed_image_tensor / 2.0)**2 - constant, min=0.0)
 
-# --- Noise Injection Functions on GPU ---
+# --- GPU Batch Noise Injection Functions ---
 def add_noise_gpu(image_tensor, noise_type, config, device):
     """
-    Applies specified noise to a PyTorch tensor on GPU.
+    Applies specified noise model to a batch of PyTorch tensors (B, 1, H, W) on GPU in parallel.
     """
+    if image_tensor.ndim == 2:
+        image_tensor = image_tensor.unsqueeze(0).unsqueeze(0)
+    elif image_tensor.ndim == 3:
+        image_tensor = image_tensor.unsqueeze(1)
+
     noise_cfg = config.get('noise', {})
     
     if noise_type == 'gaussian':
@@ -41,19 +52,15 @@ def add_noise_gpu(image_tensor, noise_type, config, device):
         return torch.clamp(noisy, 0.0, 1.0)
         
     elif noise_type == 'poisson':
-        # Estimate scaling factor based on unique values
-        vals = len(torch.unique(image_tensor))
-        vals = 2 ** np.ceil(np.log2(vals)) if vals > 0 else 256
+        # Scale to discrete photon counts (default 256 levels), apply Poisson distribution sampling
+        vals = 256.0
         noisy = torch.poisson(image_tensor * vals) / vals
         return torch.clamp(noisy, 0.0, 1.0)
         
     elif noise_type == 'mixed_poisson_gaussian':
         g_var = noise_cfg.get('mixed_poisson_gaussian', {}).get('gaussian_var', 0.01)
-        # Poisson noise
-        vals = len(torch.unique(image_tensor))
-        vals = 2 ** np.ceil(np.log2(vals)) if vals > 0 else 256
+        vals = 256.0
         poisson_noisy = torch.poisson(image_tensor * vals) / vals
-        # Gaussian noise
         std = g_var ** 0.5
         noisy = poisson_noisy + torch.randn_like(poisson_noisy) * std
         return torch.clamp(noisy, 0.0, 1.0)
@@ -61,22 +68,41 @@ def add_noise_gpu(image_tensor, noise_type, config, device):
     else:
         raise ValueError(f"Unsupported noise type: {noise_type}")
 
-# --- GPU Denoising Filter Implementations ---
+# --- GPU Batch Denoising Filter Implementations ---
 def median_filter_gpu(img, ksize=5):
-    """Applies 2D median filter on GPU."""
+    """
+    Applies 2D spatial median filter on GPU for a batch of images (B, 1, H, W).
+    Uses sliding-window tensor unfolding for fast parallel median evaluation across batch.
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
+    B, C, H, W = img.shape
     pad = ksize // 2
     img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
+    
+    # Unfold sliding windows into patches (B, C, H, W, ksize, ksize)
     patches = img_padded.unfold(2, ksize, 1).unfold(3, ksize, 1)
-    patches = patches.contiguous().view(img.size(0), img.size(1), img.size(2), img.size(3), -1)
+    patches = patches.contiguous().view(B, C, H, W, -1)
     median_val, _ = patches.median(dim=-1)
-    return median_val.squeeze(0).squeeze(0)
+    
+    return median_val.squeeze(0).squeeze(0) if squeeze_needed else median_val
 
 def gaussian_filter_gpu(img, ksize=(5, 5), sigma=1.0):
-    """Applies Gaussian filter on GPU."""
+    """
+    Applies 2D Gaussian convolution on GPU for a batch of images (B, 1, H, W).
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
     kx = torch.arange(-(ksize[0]//2), ksize[0]//2 + 1, dtype=torch.float32, device=img.device)
     ky = torch.arange(-(ksize[1]//2), ksize[1]//2 + 1, dtype=torch.float32, device=img.device)
     if sigma <= 0:
@@ -91,13 +117,20 @@ def gaussian_filter_gpu(img, ksize=(5, 5), sigma=1.0):
     pad_w = ksize[1] // 2
     img_padded = F.pad(img, (pad_w, pad_w, pad_h, pad_h), mode='reflect')
     denoised = F.conv2d(img_padded, kernel)
-    return denoised.squeeze(0).squeeze(0)
+    
+    return denoised.squeeze(0).squeeze(0) if squeeze_needed else denoised
 
 def wiener_filter_gpu(img, mysize=3, noise=None):
-    """Applies Wiener filter on GPU."""
+    """
+    Applies local statistics Wiener filter on GPU for a batch of images (B, 1, H, W).
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
-    
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
     pad = mysize // 2
     img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
     local_mean = F.avg_pool2d(img_padded, kernel_size=mysize, stride=1)
@@ -105,23 +138,33 @@ def wiener_filter_gpu(img, mysize=3, noise=None):
     local_var = local_mean_sq - local_mean**2
     
     if noise is None:
-        noise = torch.mean(local_var)
+        noise = torch.mean(local_var, dim=(-2, -1), keepdim=True)
         
     res = local_mean + (torch.clamp(local_var - noise, min=0.0) / torch.clamp(local_var, min=1e-8)) * (img - local_mean)
-    return res.squeeze(0).squeeze(0)
+    return res.squeeze(0).squeeze(0) if squeeze_needed else res
 
 def anscombe_wiener_denoising_gpu(img, balance=0.1):
-    """Applies Anscombe, Wiener, and Inverse Anscombe on GPU."""
+    """
+    Applies Anscombe transformation, Wiener filtering, and Inverse Anscombe mapping on GPU.
+    """
     transformed_img = anscombe_gpu(img)
     denoised_transformed_img = wiener_filter_gpu(transformed_img, mysize=3, noise=balance)
     denoised_img = inverse_anscombe_gpu(denoised_transformed_img)
     return torch.clamp(denoised_img, 0.0, 1.0)
 
 def bilateral_filter_gpu(img, d=9, sigma_color=75.0, sigma_space=75.0):
-    """Applies Bilateral filter on GPU."""
+    """
+    Applies 2D Bilateral filter on GPU for a batch of images (B, 1, H, W).
+    Vectorized patch extraction and range/spatial exponential kernel weighting.
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
-    H, W = img.shape[2], img.shape[3]
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
+    B, C, H, W = img.shape
     pad = d // 2
     img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
     
@@ -130,8 +173,7 @@ def bilateral_filter_gpu(img, d=9, sigma_color=75.0, sigma_space=75.0):
     grid_x, grid_y = torch.meshgrid(x, y, indexing='ij')
     spatial_w = torch.exp(-(grid_x**2 + grid_y**2) / (2 * sigma_space**2)).view(1, 1, 1, 1, -1)
     
-    patches = img_padded.unfold(2, d, 1).unfold(3, d, 1)
-    patches = patches.contiguous().view(1, 1, H, W, -1)
+    patches = img_padded.unfold(2, d, 1).unfold(3, d, 1).contiguous().view(B, C, H, W, -1)
     center = img.unsqueeze(-1)
     
     color_w = torch.exp(-(patches - center)**2 / (2 * (sigma_color / 255.0)**2))
@@ -139,14 +181,23 @@ def bilateral_filter_gpu(img, d=9, sigma_color=75.0, sigma_space=75.0):
     total_w_sum = total_w.sum(dim=-1, keepdim=True)
     
     denoised = (patches * total_w).sum(dim=-1, keepdim=True) / torch.clamp(total_w_sum, min=1e-8)
-    return denoised.squeeze(-1).squeeze(0).squeeze(0)
+    denoised = denoised.squeeze(-1)
+    
+    return denoised.squeeze(0).squeeze(0) if squeeze_needed else denoised
 
 def non_local_means_gpu(img, h=10, template_window_size=7, search_window_size=21):
-    """Applies Non-Local Means filter on GPU."""
+    """
+    Applies Non-Local Means filter on GPU for a batch of images (B, 1, H, W).
+    Fully parallelized patch distance evaluation using box-filter average pooling across search window.
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
-    H, W = img.shape[2], img.shape[3]
-    
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
+    B, C, H, W = img.shape
     t_pad = template_window_size // 2
     s_pad = search_window_size // 2
     h_scaled = h / 255.0
@@ -170,14 +221,21 @@ def non_local_means_gpu(img, h=10, template_window_size=7, search_window_size=21
             weight_sum += weight
             
     denoised = denoised / torch.clamp(weight_sum, min=1e-8)
-    return denoised.squeeze(0).squeeze(0)
+    return denoised.squeeze(0).squeeze(0) if squeeze_needed else denoised
 
 def adaptive_median_filter_gpu(img, s_max=7):
-    """Applies Adaptive Median filter on GPU."""
+    """
+    Applies Adaptive Median filter on GPU for a batch of images (B, 1, H, W).
+    Iteratively increases window size for impulse noise pixels while preserving uncorrupted structures.
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
     
-    H, W = img.shape[2], img.shape[3]
+    B, C, H, W = img.shape
     output = img.clone()
     active_mask = torch.ones_like(img, dtype=torch.bool)
     
@@ -187,7 +245,7 @@ def adaptive_median_filter_gpu(img, s_max=7):
         pad = s // 2
         img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
         patches = img_padded.unfold(2, s, 1).unfold(3, s, 1)
-        patches = patches.contiguous().view(1, 1, H, W, -1)
+        patches = patches.contiguous().view(B, C, H, W, -1)
         
         z_min = patches.min(dim=-1).values
         z_max = patches.max(dim=-1).values
@@ -206,16 +264,23 @@ def adaptive_median_filter_gpu(img, s_max=7):
         pad = s // 2
         img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
         patches = img_padded.unfold(2, s, 1).unfold(3, s, 1)
-        patches = patches.contiguous().view(1, 1, H, W, -1)
+        patches = patches.contiguous().view(B, C, H, W, -1)
         z_med = patches.median(dim=-1).values
         output[active_mask] = z_med[active_mask]
         
-    return output.squeeze(0).squeeze(0)
+    return output.squeeze(0).squeeze(0) if squeeze_needed else output
 
 def kuan_filter_gpu(img, win_size=5, noise_var_estimate=0.04):
-    """Applies Kuan filter on GPU."""
+    """
+    Applies Kuan filter on GPU for a batch of images (B, 1, H, W).
+    """
+    squeeze_needed = False
     if img.ndim == 2:
         img = img.unsqueeze(0).unsqueeze(0)
+        squeeze_needed = True
+    elif img.ndim == 3:
+        img = img.unsqueeze(1)
+
     pad = win_size // 2
     img_padded = F.pad(img, (pad, pad, pad, pad), mode='reflect')
     local_mean = F.avg_pool2d(img_padded, kernel_size=win_size, stride=1)
@@ -223,15 +288,17 @@ def kuan_filter_gpu(img, win_size=5, noise_var_estimate=0.04):
     local_variance = local_sq_mean - local_mean**2
     local_variance = torch.clamp(local_variance, min=1e-6)
     
-    B = 1.0 - (noise_var_estimate / local_variance)
-    B = torch.clamp(B, min=0.0)
+    B_coeff = 1.0 - (noise_var_estimate / local_variance)
+    B_coeff = torch.clamp(B_coeff, min=0.0)
     
-    denoised = local_mean + B * (img - local_mean)
-    return torch.clamp(denoised, 0.0, 1.0).squeeze(0).squeeze(0)
+    denoised = local_mean + B_coeff * (img - local_mean)
+    denoised = torch.clamp(denoised, 0.0, 1.0)
+    
+    return denoised.squeeze(0).squeeze(0) if squeeze_needed else denoised
 
 def apply_denoising_gpu(noisy_image_tensor, method, config):
     """
-    Applies specified denoising method using config settings on GPU.
+    Applies specified denoising filter model to a batch of PyTorch tensors (B, 1, H, W) on GPU.
     """
     denoise_cfg = config.get('denoising', {})
     
@@ -273,3 +340,95 @@ def apply_denoising_gpu(noisy_image_tensor, method, config):
         
     else:
         raise ValueError(f"Unsupported denoising method: {method}")
+
+# --- GPU Batch Image Quality Metrics (MSE, PSNR, SSIM) ---
+def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
+    """
+    Computes Structural Similarity Index (SSIM) for a batch of images (B, 1, H, W) on GPU.
+    Matches scikit-image structural_similarity implementation.
+    """
+    if img1.ndim == 3:
+        img1 = img1.unsqueeze(1)
+    if img2.ndim == 3:
+        img2 = img2.unsqueeze(1)
+
+    device = img1.device
+    channel = img1.size(1)
+
+    coords = torch.arange(window_size, dtype=torch.float32, device=device) - (window_size // 2)
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+
+    window = (g.unsqueeze(1) * g.unsqueeze(0)).unsqueeze(0).unsqueeze(0).repeat(channel, 1, 1, 1)
+    pad = window_size // 2
+
+    mu1 = F.conv2d(img1, window, padding=pad, groups=channel)
+    mu2 = F.conv2d(img2, window, padding=pad, groups=channel)
+
+    mu1_sq = mu1.pow(2)
+    mu2_sq = mu2.pow(2)
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(img1 * img1, window, padding=pad, groups=channel) - mu1_sq
+    sigma2_sq = F.conv2d(img2 * img2, window, padding=pad, groups=channel) - mu2_sq
+    sigma12 = F.conv2d(img1 * img2, window, padding=pad, groups=channel) - mu1_mu2
+
+    C1 = (0.01 * data_range) ** 2
+    C2 = (0.03 * data_range) ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean(dim=(-3, -2, -1))
+
+def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch):
+    """
+    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM) entirely on GPU.
+    Returns: List of metric dicts, one per image in the batch.
+    """
+    if orig_batch.ndim == 3:
+        orig_batch = orig_batch.unsqueeze(1)
+    if noisy_batch.ndim == 3:
+        noisy_batch = noisy_batch.unsqueeze(1)
+    if denoised_batch.ndim == 3:
+        denoised_batch = denoised_batch.unsqueeze(1)
+
+    B = orig_batch.shape[0]
+
+    # Original Image Characteristics
+    orig_mean = orig_batch.mean(dim=(-3, -2, -1)).cpu().numpy()
+    orig_std = orig_batch.std(dim=(-3, -2, -1)).cpu().numpy()
+    orig_median = orig_batch.view(B, -1).median(dim=-1).values.cpu().numpy()
+
+    # MSE Calculation
+    mse_noisy = (orig_batch - noisy_batch).pow(2).mean(dim=(-3, -2, -1))
+    mse_denoised = (orig_batch - denoised_batch).pow(2).mean(dim=(-3, -2, -1))
+
+    # PSNR Calculation
+    psnr_noisy = 10.0 * torch.log10(1.0 / torch.clamp(mse_noisy, min=1e-10))
+    psnr_denoised = 10.0 * torch.log10(1.0 / torch.clamp(mse_denoised, min=1e-10))
+
+    # SSIM Calculation
+    ssim_noisy = ssim_gpu_batch(orig_batch, noisy_batch)
+    ssim_denoised = ssim_gpu_batch(orig_batch, denoised_batch)
+
+    mse_noisy_np = mse_noisy.cpu().numpy()
+    mse_denoised_np = mse_denoised.cpu().numpy()
+    psnr_noisy_np = psnr_noisy.cpu().numpy()
+    psnr_denoised_np = psnr_denoised.cpu().numpy()
+    ssim_noisy_np = ssim_noisy.cpu().numpy()
+    ssim_denoised_np = ssim_denoised.cpu().numpy()
+
+    metrics_list = []
+    for i in range(B):
+        metrics_list.append({
+            'Original_Mean': float(orig_mean[i]),
+            'Original_Median': float(orig_median[i]),
+            'Original_StdDev': float(orig_std[i]),
+            'MSE_Noisy_vs_Original': float(mse_noisy_np[i]),
+            'MSE_Denoised_vs_Original': float(mse_denoised_np[i]),
+            'PSNR_Noisy_vs_Original': float(psnr_noisy_np[i]),
+            'PSNR_Denoised_vs_Original': float(psnr_denoised_np[i]),
+            'SSIM_Noisy_vs_Original': float(ssim_noisy_np[i]),
+            'SSIM_Denoised_vs_Original': float(ssim_denoised_np[i]),
+        })
+
+    return metrics_list

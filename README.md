@@ -135,11 +135,11 @@ docker build -f Dockerfile.gpu -t breast-cancer-denoising:gpu .
 **Run GPU Container:**
 * **Windows (CMD):**
   ```cmd
-  docker run --rm --gpus all -v "%cd%\data:/app/data" breast-cancer-denoising:gpu
+  docker run --rm --gpus all --shm-size=8g -v "%cd%\data:/app/data" breast-cancer-denoising:gpu
   ```
 * **Linux / macOS (Bash):**
   ```bash
-  docker run --rm --gpus all -v "$(pwd)/data:/app/data" breast-cancer-denoising:gpu
+  docker run --rm --gpus all --shm-size=8g -v "$(pwd)/data:/app/data" breast-cancer-denoising:gpu
   ```
 
 ---

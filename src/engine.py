@@ -117,6 +117,7 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     print(f"\nSummary statistics saved to:\n  - {summary_csv_path}\n  - {summary_excel_path}")
     
     # Generate and save comparison plots
+    # Generate performance plots
     print("Generating performance plots...")
     psnr_plot_path = os.path.join(results_dir, 'psnr_comparison.png')
     plot_metrics_comparison(
@@ -135,12 +136,21 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         'Average SSIM', 
         save_path=ssim_plot_path
     )
+
+    mse_plot_path = os.path.join(results_dir, 'mse_comparison.png')
+    plot_metrics_comparison(
+        all_results_df, 
+        'MSE_Denoised_vs_Original',
+        'Average MSE Comparison (Denoised vs Original)', 
+        'Average MSE', 
+        save_path=mse_plot_path
+    )
     print(f"Plots saved in: {results_dir}")
     
     # Generate sample visualization for verification
     sample_row = all_results_df.iloc[0]
     original_img_path = os.path.join(raw_dir, sample_row['Class'], sample_row['Image Name'])
-    from src.utils import read_and_preprocess_image
+    from src.utils import read_and_preprocess_image, display_sample_mse_images
     orig = read_and_preprocess_image(original_img_path, image_size)
     noisy = read_and_preprocess_image(sample_row['Noisy Image Path'], image_size)
     denoised = read_and_preprocess_image(sample_row['Denoised Image Path'], image_size)
@@ -153,6 +163,14 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
             save_path=sample_viz_path
         )
         print(f"Sample visualization saved to: {sample_viz_path}")
+
+        sample_mse_viz_path = os.path.join(results_dir, 'sample_mean_squared_image.png')
+        display_sample_mse_images(
+            orig, noisy, denoised,
+            title_suffix=f"({sample_row['Noise Type']} / {sample_row['Denoising Method']})",
+            save_path=sample_mse_viz_path
+        )
+        print(f"Sample MSE visualization saved to: {sample_mse_viz_path}")
 
 if __name__ == "__main__":
     # Run on all images in the dataset

@@ -66,11 +66,22 @@ class MammographyDataset(Dataset):
 def create_gpu_dataloader(image_items, target_size=(256, 256), batch_size=32, num_workers=4):
     """
     Creates an optimized PyTorch DataLoader for GPU pipeline with pinned memory and multi-threading.
+    Automatically checks available shared memory (/dev/shm) to prevent Docker SIGBUS worker crashes.
     """
     dataset = MammographyDataset(image_items, target_size=target_size)
     
-    # Adjust num_workers if running in restricted environments
-    actual_workers = min(num_workers, os.cpu_count() or 1)
+    # Adjust num_workers if running in restricted shared memory environments (e.g. Docker 64MB default /dev/shm)
+    import shutil
+    shm_available = True
+    if os.path.exists('/dev/shm'):
+        try:
+            shm_total = shutil.disk_usage('/dev/shm').total
+            if shm_total < 500 * 1024 * 1024:  # Less than 500MB shared memory
+                shm_available = False
+        except Exception:
+            pass
+
+    actual_workers = min(num_workers, os.cpu_count() or 1) if shm_available else 0
     
     dataloader = DataLoader(
         dataset,

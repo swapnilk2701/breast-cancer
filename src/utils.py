@@ -103,6 +103,39 @@ def display_sample_images(original_img, noisy_img, denoised_img, title_suffix=""
     else:
         plt.close()
 
+def display_sample_mse_images(original_img, noisy_img, denoised_img, title_suffix="", show_plot=False, save_path=None):
+    """
+    Displays Original Image, Noisy Squared Error (MSE) map, and Denoised Squared Error (MSE) map side-by-side.
+    """
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    
+    axes[0].imshow(original_img, cmap='gray')
+    axes[0].set_title('Original Image')
+    axes[0].axis('off')
+
+    noisy_se = (noisy_img - original_img) ** 2
+    noisy_mse = np.mean(noisy_se)
+    im1 = axes[1].imshow(noisy_se, cmap='hot')
+    axes[1].set_title(f'Noisy Squared Error {title_suffix}\n(MSE: {noisy_mse:.6f})')
+    axes[1].axis('off')
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+
+    denoised_se = (denoised_img - original_img) ** 2
+    denoised_mse = np.mean(denoised_se)
+    im2 = axes[2].imshow(denoised_se, cmap='hot')
+    axes[2].set_title(f'Denoised Squared Error {title_suffix}\n(MSE: {denoised_mse:.6f})')
+    axes[2].axis('off')
+    fig.colorbar(im2, ax=axes[2], fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    if save_path:
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
 def plot_metrics_comparison(df, metric_name, title, y_label, save_path=None, show_plot=False):
     """
     Generates comparison plots for specified metrics (e.g., PSNR, SSIM).

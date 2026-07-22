@@ -241,4 +241,4 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
         print(f"Sample visualization saved to: {sample_viz_path}")
 
 if __name__ == "__main__":
-    run_pipeline(max_images=32, batch_size=32)
+    run_pipeline(max_images=None, batch_size=32)

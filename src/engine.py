@@ -137,13 +137,22 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         save_path=ssim_plot_path
     )
 
-    mse_plot_path = os.path.join(results_dir, 'mse_comparison.png')
+    mse_plot_path = os.path.join(results_dir, 'mean_squared_comparison.png')
+    plot_metrics_comparison(
+        all_results_df, 
+        'MSE_Denoised_vs_Original',
+        'Average Mean Squared Error (MSE) Comparison (Denoised vs Original)', 
+        'Average MSE', 
+        save_path=mse_plot_path
+    )
+
+    # Also save as mse_comparison.png for alternative naming reference
     plot_metrics_comparison(
         all_results_df, 
         'MSE_Denoised_vs_Original',
         'Average MSE Comparison (Denoised vs Original)', 
         'Average MSE', 
-        save_path=mse_plot_path
+        save_path=os.path.join(results_dir, 'mse_comparison.png')
     )
     print(f"Plots saved in: {results_dir}")
     

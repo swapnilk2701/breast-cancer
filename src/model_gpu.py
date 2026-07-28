@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
+from src.contrast_sharpening import MammogramEnhancer
 
 # --- GPU Batch Anscombe Transform Functions ---
 def anscombe_gpu(image_tensor, constant=3/8):
@@ -341,6 +342,33 @@ def apply_denoising_gpu(noisy_image_tensor, method, config):
     else:
         raise ValueError(f"Unsupported denoising method: {method}")
 
+# --- Stage 5: GPU Batch Contrast Enhancement & Sharpening ---
+def apply_contrast_sharpening_gpu(denoised_tensor, config):
+    """
+    Applies Stage 5 Contrast Enhancement (CLAHE) and Sharpening (Unsharp Masking) to batched PyTorch tensors (B, 1, H, W).
+    Configurable clip limit (2.0), tile grid size (8, 8), blur kernel (5, 5), sigma (1.0), sharpen strength (1.2).
+    """
+    enh_cfg = config.get('enhancement', {})
+    clip_limit = enh_cfg.get('clahe', {}).get('clip_limit', 2.0)
+    tile_grid = tuple(enh_cfg.get('clahe', {}).get('tile_grid_size', [8, 8]))
+    ksize = tuple(enh_cfg.get('unsharp_mask', {}).get('kernel_size', [5, 5]))
+    sigma = enh_cfg.get('unsharp_mask', {}).get('sigma', 1.0)
+    amount = enh_cfg.get('unsharp_mask', {}).get('amount', 1.2)
+
+    enhancer = MammogramEnhancer(
+        clip_limit=clip_limit,
+        tile_grid_size=tile_grid,
+        blur_kernel_size=ksize,
+        blur_sigma=sigma,
+        sharpen_amount=amount
+    )
+
+    device = denoised_tensor.device
+    np_batch = (torch.clamp(denoised_tensor, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
+    enhanced_np = enhancer.process_batch(np_batch)  # Returns (B, H, W) uint8
+    enhanced_tensor = torch.from_numpy(enhanced_np.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+    return enhanced_tensor
+
 # --- GPU Batch Image Quality Metrics (MSE, PSNR, SSIM) ---
 def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
     """
@@ -379,9 +407,9 @@ def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
     ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
     return ssim_map.mean(dim=(-3, -2, -1))
 
-def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch):
+def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhanced_batch=None):
     """
-    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM) entirely on GPU.
+    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM, Laplacian Variance) entirely on GPU.
     Returns: List of metric dicts, one per image in the batch.
     """
     if orig_batch.ndim == 3:
@@ -417,9 +445,20 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch):
     ssim_noisy_np = ssim_noisy.cpu().numpy()
     ssim_denoised_np = ssim_denoised.cpu().numpy()
 
+    if enhanced_batch is not None:
+        if enhanced_batch.ndim == 3:
+            enhanced_batch = enhanced_batch.unsqueeze(1)
+        mse_enhanced = (orig_batch - enhanced_batch).pow(2).mean(dim=(-3, -2, -1))
+        psnr_enhanced = 10.0 * torch.log10(1.0 / torch.clamp(mse_enhanced, min=1e-10))
+        ssim_enhanced = ssim_gpu_batch(orig_batch, enhanced_batch)
+
+        mse_enhanced_np = mse_enhanced.cpu().numpy()
+        psnr_enhanced_np = psnr_enhanced.cpu().numpy()
+        ssim_enhanced_np = ssim_enhanced.cpu().numpy()
+
     metrics_list = []
     for i in range(B):
-        metrics_list.append({
+        row_metrics = {
             'Original_Mean': float(orig_mean[i]),
             'Original_Median': float(orig_median[i]),
             'Original_StdDev': float(orig_std[i]),
@@ -429,6 +468,14 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch):
             'PSNR_Denoised_vs_Original': float(psnr_denoised_np[i]),
             'SSIM_Noisy_vs_Original': float(ssim_noisy_np[i]),
             'SSIM_Denoised_vs_Original': float(ssim_denoised_np[i]),
-        })
+        }
+        if enhanced_batch is not None:
+            row_metrics.update({
+                'MSE_Enhanced_vs_Original': float(mse_enhanced_np[i]),
+                'PSNR_Enhanced_vs_Original': float(psnr_enhanced_np[i]),
+                'SSIM_Enhanced_vs_Original': float(ssim_enhanced_np[i]),
+            })
+        metrics_list.append(row_metrics)
 
     return metrics_list
+

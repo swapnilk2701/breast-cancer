@@ -16,6 +16,7 @@ from src.data_loader import get_image_paths, create_gpu_dataloader
 from src.model_gpu import (
     add_noise_gpu,
     apply_denoising_gpu,
+    apply_contrast_sharpening_gpu,
     calculate_metrics_gpu_batch
 )
 
@@ -54,9 +55,11 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
     
     noisy_out_dir = os.path.join(processed_dir, 'noisy')
     denoised_out_dir = os.path.join(processed_dir, 'denoised')
+    enhanced_out_dir = os.path.join(processed_dir, 'enhanced')
     
     os.makedirs(noisy_out_dir, exist_ok=True)
     os.makedirs(denoised_out_dir, exist_ok=True)
+    os.makedirs(enhanced_out_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
     
     supported_formats = config['data']['supported_formats']
@@ -137,8 +140,21 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
                         denoised_paths.append(denoised_path)
                         io_futures.append(io_pool.submit(save_image, denoised_np_list[i], denoised_path))
                     
-                    # 3. Compute metrics entirely in GPU VRAM
-                    metrics_batch = calculate_metrics_gpu_batch(original_batch, noisy_batch, denoised_batch)
+                    # 3. Stage 5: Contrast Enhancement + Sharpening (CLAHE + Unsharp Masking)
+                    enhanced_batch = apply_contrast_sharpening_gpu(denoised_batch, config)
+
+                    # Asynchronously schedule saving Stage 5 enhanced images
+                    enhanced_np_list = batch_tensor_to_numpy_list(enhanced_batch)
+                    enhanced_paths = []
+                    for i in range(current_batch_size):
+                        base_name = os.path.splitext(image_names[i])[0]
+                        enhanced_filename = f"{base_name}_{noise_name}_{method_name}_enhanced.png"
+                        enhanced_path = os.path.join(enhanced_out_dir, enhanced_filename)
+                        enhanced_paths.append(enhanced_path)
+                        io_futures.append(io_pool.submit(save_image, enhanced_np_list[i], enhanced_path))
+
+                    # 4. Compute metrics in VRAM (Original vs Noisy vs Denoised vs Enhanced)
+                    metrics_batch = calculate_metrics_gpu_batch(original_batch, noisy_batch, denoised_batch, enhanced_batch)
                     
                     # Record results
                     for i in range(current_batch_size):
@@ -149,7 +165,8 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
                             'Denoising Method': method_name,
                             **metrics_batch[i],
                             'Noisy Image Path': noisy_paths[i],
-                            'Denoised Image Path': denoised_paths[i]
+                            'Denoised Image Path': denoised_paths[i],
+                            'Enhanced Image Path': enhanced_paths[i]
                         }
                         results_list.append(row)
                         
@@ -189,7 +206,10 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
     print(f"Raw results saved to:\n  - {csv_path}\n  - {excel_path}")
     
     # Compute summary statistics
-    summary_metrics = ['PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original']
+    summary_metrics = [
+        'PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original',
+        'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original', 'MSE_Enhanced_vs_Original'
+    ]
     summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[summary_metrics].mean().reset_index()
     summary_df_sorted = summary_df.sort_values(by=['Noise Type', 'PSNR_Denoised_vs_Original'], ascending=[True, False])
     
@@ -267,4 +287,4 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
         print(f"Sample MSE visualization saved to: {sample_mse_viz_path}")
 
 if __name__ == "__main__":
-    run_pipeline(max_images=None, batch_size=32)
+    run_pipeline(max_images=32, batch_size=32)

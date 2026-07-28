@@ -11,6 +11,20 @@ data:
   image_size: [256, 256]
   supported_formats: [".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"]
 
+pectoral_removal:
+  enabled: true
+  roi_fraction_h: 0.5
+  roi_fraction_w: 0.5
+  fill_value: 0
+
+intensity_normalization:
+  enabled: true
+  method: "robust_min_max"
+  p_low: 1.0
+  p_high: 99.0
+  target_min: 0.0
+  target_max: 255.0
+
 noise:
   gaussian:
     var: 0.01

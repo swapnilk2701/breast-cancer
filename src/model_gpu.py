@@ -2,6 +2,8 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from src.contrast_sharpening import MammogramEnhancer
+from src.pectoral_removal import PectoralMuscleRemover
+from src.intensity_normalization import IntensityNormalizer
 
 # --- GPU Batch Anscombe Transform Functions ---
 def anscombe_gpu(image_tensor, constant=3/8):
@@ -368,6 +370,84 @@ def apply_contrast_sharpening_gpu(denoised_tensor, config):
     enhanced_np = enhancer.process_batch(np_batch)  # Returns (B, H, W) uint8
     enhanced_tensor = torch.from_numpy(enhanced_np.astype(np.float32) / 255.0).unsqueeze(1).to(device)
     return enhanced_tensor
+
+# --- Preprocessing: GPU Batch Pectoral Muscle Removal ---
+def remove_pectoral_muscle_gpu(image_tensor, config):
+    """
+    Applies Pectoral Muscle Removal to batched PyTorch tensors (B, 1, H, W).
+    Identifies and masks out high-intensity triangular pectoral muscle regions in MLO mammograms.
+    
+    Workflow:
+    1. Reads configuration parameters (`roi_fraction_h`, `roi_fraction_w`, `fill_value`).
+    2. Converts GPU tensor batch in range [0, 1] to uint8 NumPy array in range [0, 255].
+    3. Runs batched PectoralMuscleRemover algorithm across all images in parallel.
+    4. Converts cleaned numpy arrays back into normalized PyTorch GPU tensors in VRAM.
+    """
+    pec_cfg = config.get('pectoral_removal', {})
+    if not pec_cfg.get('enabled', True):
+        # Return original tensor unchanged if pectoral removal is disabled in config
+        return image_tensor
+
+    # Extract configuration options
+    roi_h = pec_cfg.get('roi_fraction_h', 0.5)
+    roi_w = pec_cfg.get('roi_fraction_w', 0.5)
+    fill_val = pec_cfg.get('fill_value', 0)
+
+    # Instantiate PectoralMuscleRemover
+    remover = PectoralMuscleRemover(
+        roi_fraction_h=roi_h,
+        roi_fraction_w=roi_w,
+        fill_value=fill_val
+    )
+
+    device = image_tensor.device
+    
+    # 1. Transfer PyTorch GPU tensor batch (B, 1, H, W) to CPU NumPy uint8 batch (B, H, W)
+    np_batch = (torch.clamp(image_tensor, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
+    
+    # 2. Execute pectoral muscle removal across the batch
+    cleaned_np, _ = remover.process_batch(np_batch)  # Returns cleaned (B, H, W) uint8
+    
+    # 3. Convert cleaned NumPy batch back into PyTorch float32 tensor [0, 1] on target GPU device
+    cleaned_tensor = torch.from_numpy(cleaned_np.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+    
+    return cleaned_tensor
+
+# --- Preprocessing: GPU Batch Intensity Normalization ---
+def normalize_intensity_gpu(image_tensor, config):
+    """
+    Applies Intensity Normalization to batched PyTorch tensors (B, 1, H, W).
+    Standardizes pixel intensity range across acquisition devices ('min_max', 'robust_min_max', 'z_score', 'tissue_z_score').
+    """
+    norm_cfg = config.get('intensity_normalization', {})
+    if not norm_cfg.get('enabled', True):
+        return image_tensor
+
+    method = norm_cfg.get('method', 'robust_min_max')
+    p_low = norm_cfg.get('p_low', 1.0)
+    p_high = norm_cfg.get('p_high', 99.0)
+    t_min = norm_cfg.get('target_min', 0.0)
+    t_max = norm_cfg.get('target_max', 255.0)
+
+    normalizer = IntensityNormalizer(
+        method=method,
+        p_low=p_low,
+        p_high=p_high,
+        target_min=t_min,
+        target_max=t_max
+    )
+
+    device = image_tensor.device
+    np_batch = (torch.clamp(image_tensor, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
+    norm_np = normalizer.process_batch(np_batch)  # Returns (B, H, W) normalized
+    
+    # Scale back to PyTorch GPU float32 tensor in range [0, 1]
+    if norm_np.dtype == np.uint8:
+        norm_tensor = torch.from_numpy(norm_np.astype(np.float32) / 255.0).unsqueeze(1).to(device)
+    else:
+        norm_tensor = torch.from_numpy(norm_np.astype(np.float32)).unsqueeze(1).to(device)
+
+    return norm_tensor
 
 # --- GPU Batch Image Quality Metrics (MSE, PSNR, SSIM) ---
 def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):

@@ -17,6 +17,8 @@ from src.model_gpu import (
     add_noise_gpu,
     apply_denoising_gpu,
     apply_contrast_sharpening_gpu,
+    remove_pectoral_muscle_gpu,
+    normalize_intensity_gpu,
     calculate_metrics_gpu_batch
 )
 
@@ -56,10 +58,14 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
     noisy_out_dir = os.path.join(processed_dir, 'noisy')
     denoised_out_dir = os.path.join(processed_dir, 'denoised')
     enhanced_out_dir = os.path.join(processed_dir, 'enhanced')
+    pectoral_out_dir = os.path.join(processed_dir, 'pectoral_removed')
+    normalized_out_dir = os.path.join(processed_dir, 'normalized')
     
     os.makedirs(noisy_out_dir, exist_ok=True)
     os.makedirs(denoised_out_dir, exist_ok=True)
     os.makedirs(enhanced_out_dir, exist_ok=True)
+    os.makedirs(pectoral_out_dir, exist_ok=True)
+    os.makedirs(normalized_out_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
     
     supported_formats = config['data']['supported_formats']
@@ -106,8 +112,30 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
             current_batch_size = batch_tensors.size(0)
             
             # Non-blocking transfer to GPU memory
-            original_batch = batch_tensors.to(device, non_blocking=True)
+            raw_batch = batch_tensors.to(device, non_blocking=True)
             
+            # Preprocessing Stage 1: Pectoral Muscle Removal
+            pec_removed_batch = remove_pectoral_muscle_gpu(raw_batch, config)
+
+            # Asynchronously schedule saving pectoral-removed images
+            pec_np_list = batch_tensor_to_numpy_list(pec_removed_batch)
+            for i in range(current_batch_size):
+                base_name = os.path.splitext(batch_items["image_name"][i])[0]
+                pec_filename = f"{base_name}_pectoral_removed.png"
+                pec_path = os.path.join(pectoral_out_dir, pec_filename)
+                io_futures.append(io_pool.submit(save_image, pec_np_list[i], pec_path))
+
+            # Preprocessing Stage 2: Intensity Normalization
+            original_batch = normalize_intensity_gpu(pec_removed_batch, config)
+
+            # Asynchronously schedule saving intensity-normalized images
+            norm_np_list = batch_tensor_to_numpy_list(original_batch)
+            for i in range(current_batch_size):
+                base_name = os.path.splitext(batch_items["image_name"][i])[0]
+                norm_filename = f"{base_name}_normalized.png"
+                norm_path = os.path.join(normalized_out_dir, norm_filename)
+                io_futures.append(io_pool.submit(save_image, norm_np_list[i], norm_path))
+
             # Extract metadata lists from batch_items
             image_names = batch_items["image_name"]
             classes = batch_items["class"]
@@ -287,4 +315,4 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
         print(f"Sample MSE visualization saved to: {sample_mse_viz_path}")
 
 if __name__ == "__main__":
-    run_pipeline(max_images=32, batch_size=32)
+    run_pipeline(max_images=10, batch_size=5)

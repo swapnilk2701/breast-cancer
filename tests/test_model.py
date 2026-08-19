@@ -44,5 +44,20 @@ class TestMammographyPipeline(unittest.TestCase):
             self.assertTrue(np.all(denoised_img >= 0.0), f"Negative pixel values for method: {method}")
             self.assertTrue(np.all(denoised_img <= 1.0), f"Pixel values exceeding 1.0 for method: {method}")
 
+    def test_contrast_enhancement(self):
+        from src.model import apply_contrast_enhancement
+        enh_config = {
+            'enhancement': {
+                'clahe': {'clip_limit': 2.0, 'tile_grid_size': [8, 8]},
+                'unsharp_mask': {'kernel_size': [5, 5], 'sigma': 1.0, 'amount': 1.2}
+            }
+        }
+        for method in ['he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask']:
+            enhanced_img = apply_contrast_enhancement(self.test_img, method, enh_config)
+            self.assertEqual(enhanced_img.shape, self.test_img.shape, f"Shape mismatch for {method}")
+            self.assertTrue(np.all(enhanced_img >= 0.0), f"Negative pixel values for {method}")
+            self.assertTrue(np.all(enhanced_img <= 1.0), f"Pixel values exceeding 1.0 for {method}")
+
 if __name__ == '__main__':
     unittest.main()
+

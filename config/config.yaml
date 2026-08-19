@@ -55,6 +55,8 @@ denoising:
     s_max: 7
 
 enhancement:
+  enabled: true
+  method: "clahe_unsharp_mask"  # Options: 'he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask'
   clahe:
     clip_limit: 2.0
     tile_grid_size: [8, 8]
@@ -62,3 +64,6 @@ enhancement:
     kernel_size: [5, 5]
     sigma: 1.0
     amount: 1.2
+  metrics:
+    window_size: 16
+

@@ -235,10 +235,16 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
     
     # Compute summary statistics
     summary_metrics = [
-        'PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original',
-        'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original', 'MSE_Enhanced_vs_Original'
+        'PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original'
     ]
-    summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[summary_metrics].mean().reset_index()
+    if 'PSNR_Enhanced_vs_Original' in all_results_df.columns:
+        summary_metrics.extend([
+            'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original', 'MSE_Enhanced_vs_Original',
+            'Enhanced_Entropy', 'Entropy_Delta', 'CII'
+        ])
+
+    available_summary_metrics = [m for m in summary_metrics if m in all_results_df.columns]
+    summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[available_summary_metrics].mean().reset_index()
     summary_df_sorted = summary_df.sort_values(by=['Noise Type', 'PSNR_Denoised_vs_Original'], ascending=[True, False])
     
     summary_csv_path = os.path.join(results_dir, 'summary_statistics.csv')
@@ -287,12 +293,24 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
         'Average MSE', 
         save_path=os.path.join(results_dir, 'mse_comparison.png')
     )
+
+    if 'CII' in all_results_df.columns:
+        cii_plot_path = os.path.join(results_dir, 'cii_comparison.png')
+        plot_metrics_comparison(
+            all_results_df,
+            'CII',
+            'Average Contrast Improvement Index (CII) Comparison',
+            'Average CII',
+            save_path=cii_plot_path
+        )
+
     print(f"Plots saved in: {results_dir}")
     
     # Sample visualization
     sample_row = all_results_df.iloc[0]
     original_img_path = os.path.join(raw_dir, sample_row['Class'], sample_row['Image Name'])
-    from src.utils import read_and_preprocess_image, display_sample_mse_images
+    from src.utils import read_and_preprocess_image, display_sample_mse_images, display_enhancement_comparison
+    from src.contrast_sharpening import MammogramEnhancer
     orig = read_and_preprocess_image(original_img_path, image_size)
     noisy = read_and_preprocess_image(sample_row['Noisy Image Path'], image_size)
     denoised = read_and_preprocess_image(sample_row['Denoised Image Path'], image_size)
@@ -313,6 +331,22 @@ def run_pipeline(config_path="config/config.yaml", max_images=None, batch_size=3
             save_path=sample_mse_viz_path
         )
         print(f"Sample MSE visualization saved to: {sample_mse_viz_path}")
+
+        # 5-panel enhancement comparison
+        enhancer = MammogramEnhancer()
+        denoised_u8 = (np.clip(denoised, 0, 1) * 255).astype(np.uint8)
+        enh_methods, _ = enhancer.compare_all_methods(denoised_u8)
+        enh_5panel_path = os.path.join(results_dir, 'sample_enhancement_comparison.png')
+        display_enhancement_comparison(
+            denoised_u8,
+            enh_methods['HE'],
+            enh_methods['CLAHE'],
+            enh_methods['Unsharp_Mask'],
+            enh_methods['CLAHE_plus_UM'],
+            title_suffix=f"({sample_row['Noise Type']} / {sample_row['Denoising Method']})",
+            save_path=enh_5panel_path
+        )
+        print(f"Sample 5-panel enhancement visualization saved to: {enh_5panel_path}")
 
 if __name__ == "__main__":
     run_pipeline(max_images=10, batch_size=5)

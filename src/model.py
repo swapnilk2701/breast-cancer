@@ -168,3 +168,52 @@ def apply_denoising(noisy_image, method, config):
         
     else:
         raise ValueError(f"Unsupported denoising method: {method}")
+
+
+# --- Stage 5: Contrast Enhancement & Sharpening Implementations ---
+def apply_he(image):
+    """Applies global Histogram Equalization (HE) baseline on float [0, 1] image."""
+    img_uint8 = np.clip(image * 255.0 if image.max() <= 1.0 else image, 0, 255).astype(np.uint8)
+    enhanced = cv2.equalizeHist(img_uint8)
+    return enhanced.astype(np.float64) / 255.0
+
+def apply_clahe(image, config):
+    """Applies CLAHE on float [0, 1] image based on configurations."""
+    enh_cfg = config.get('enhancement', {})
+    clip_limit = enh_cfg.get('clahe', {}).get('clip_limit', 2.0)
+    tile_grid = tuple(enh_cfg.get('clahe', {}).get('tile_grid_size', [8, 8]))
+
+    clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=tile_grid)
+    img_uint8 = np.clip(image * 255.0 if image.max() <= 1.0 else image, 0, 255).astype(np.uint8)
+    enhanced = clahe.apply(img_uint8)
+    return enhanced.astype(np.float64) / 255.0
+
+def apply_unsharp_mask(image, config):
+    """Applies Unsharp Masking sharpening on float [0, 1] image based on configurations."""
+    enh_cfg = config.get('enhancement', {})
+    ksize = tuple(enh_cfg.get('unsharp_mask', {}).get('kernel_size', [5, 5]))
+    sigma = enh_cfg.get('unsharp_mask', {}).get('sigma', 1.0)
+    amount = enh_cfg.get('unsharp_mask', {}).get('amount', 1.2)
+
+    img_float = np.clip(image.astype(np.float64), 0.0, 1.0)
+    blurred = cv2.GaussianBlur(img_float, ksize, sigmaX=sigma, sigmaY=sigma)
+    high_pass = img_float - blurred
+    sharpened = img_float + amount * high_pass
+    return np.clip(sharpened, 0.0, 1.0)
+
+def apply_contrast_enhancement(image, method, config):
+    """
+    Applies specified contrast enhancement/sharpening technique:
+    'he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask'
+    """
+    if method == 'he':
+        return apply_he(image)
+    elif method == 'clahe':
+        return apply_clahe(image, config)
+    elif method == 'unsharp_mask':
+        return apply_unsharp_mask(image, config)
+    elif method in ['clahe_unsharp_mask', 'combined']:
+        clahe_img = apply_clahe(image, config)
+        return apply_unsharp_mask(clahe_img, config)
+    else:
+        raise ValueError(f"Unsupported contrast enhancement method: {method}")

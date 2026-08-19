@@ -1,22 +1,221 @@
 """
 Mammography Contrast Enhancement and Sharpening Module (Stage 5 Pipeline).
 
-Implements Stage 5 (Contrast Enhancement and Sharpening) for an
-AI-based breast cancer detection pipeline using mammography ROI crops (227x227 8-bit PNG).
+Implements Section 3 (Contrast Enhancement and Sharpening Plan) for an
+AI-based breast cancer detection pipeline using mammography ROI crops.
+
+Techniques Implemented:
+1. Histogram Equalization (HE): Baseline method used to demonstrate global contrast adjustment
+   and contrast limitation benefits.
+2. Contrast Limited Adaptive Histogram Equalization (CLAHE): Primary contrast enhancement method
+   preventing noise over-amplification in fatty/background tissue.
+3. Unsharp Masking (UM): High-frequency spatial filtering to enhance edge sharpness and microcalcification visibility.
+4. Combined CLAHE + UM: Final pipeline combining tile-based local contrast equalization with unsharp edge enhancement.
+
+Evaluation Metrics:
+- PSNR (Peak Signal-to-Noise Ratio): Pixel-level fidelity against reference image.
+- SSIM (Structural Similarity Index Measure): Structural/perceptual similarity preserving diagnostic morphology.
+- Shannon Entropy: Information content / detail richness (higher entropy = more visible detail).
+- Contrast Improvement Index (CII): Ratio of enhanced local contrast to original local contrast.
 """
 
-from typing import Tuple, Union, Optional, List
+from typing import Tuple, Union, Optional, List, Dict
 import cv2
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
+from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 
+
+# =====================================================================
+# Quantitative Metrics Functions for Contrast Enhancement Evaluation
+# =====================================================================
+
+def calculate_entropy(image: np.ndarray) -> float:
+    """
+    Computes the Shannon Entropy (information content) of an image in bits.
+    
+    Formula:
+        H = - sum_{i} p(i) * log2(p(i))
+    where p(i) is the empirical probability of intensity level i.
+
+    Args:
+        image (np.ndarray): 2D grayscale image (uint8 [0, 255] or float [0, 1]).
+
+    Returns:
+        float: Shannon entropy value in bits (typically in [0.0, 8.0] for 8-bit images).
+    """
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"Input must be a numpy.ndarray, got {type(image)}")
+    if image.size == 0:
+        raise ValueError("Input image is empty.")
+
+    # Convert to 8-bit integer representation [0, 255]
+    if image.dtype != np.uint8:
+        img_uint8 = np.clip(image * 255.0 if image.max() <= 1.0 else image, 0, 255).astype(np.uint8)
+    else:
+        img_uint8 = image
+
+    # Compute intensity histogram probability distribution
+    hist, _ = np.histogram(img_uint8.ravel(), bins=256, range=(0, 256))
+    prob = hist.astype(np.float64) / hist.sum()
+
+    # Filter out zero probabilities to avoid log2(0)
+    prob_non_zero = prob[prob > 0]
+    entropy_val = -np.sum(prob_non_zero * np.log2(prob_non_zero))
+
+    return float(entropy_val)
+
+
+def calculate_image_contrast(image: np.ndarray, window_size: int = 16) -> float:
+    """
+    Computes local patch-based Michelson/Weber contrast for a mammogram image.
+    
+    Divides the image into non-overlapping or sliding windows and computes:
+        C_patch = (I_max - I_min) / (I_max + I_min + eps)
+    and returns the mean contrast across all non-background windows.
+
+    Args:
+        image (np.ndarray): 2D grayscale image.
+        window_size (int): Tile window dimension for local contrast evaluation (default: 16).
+
+    Returns:
+        float: Average local contrast value in [0.0, 1.0].
+    """
+    if not isinstance(image, np.ndarray):
+        raise TypeError(f"Input must be a numpy.ndarray, got {type(image)}")
+    if image.size == 0:
+        raise ValueError("Input image is empty.")
+    if window_size <= 0:
+        raise ValueError(f"window_size must be positive, got {window_size}")
+
+    img_float = image.astype(np.float64)
+    if img_float.max() > 1.0:
+        img_float = img_float / 255.0
+
+    H, W = img_float.shape[:2]
+    contrasts = []
+    eps = 1e-6
+
+    # Extract non-overlapping patches
+    for y in range(0, H - window_size + 1, window_size):
+        for x in range(0, W - window_size + 1, window_size):
+            patch = img_float[y:y + window_size, x:x + window_size]
+            p_min = patch.min()
+            p_max = patch.max()
+            denominator = p_max + p_min + eps
+            c = (p_max - p_min) / denominator
+            contrasts.append(c)
+
+    if not contrasts:
+        # Fallback to whole-image Michelson contrast if image is smaller than window
+        c_global = (img_float.max() - img_float.min()) / (img_float.max() + img_float.min() + eps)
+        return float(c_global)
+
+    return float(np.mean(contrasts))
+
+
+def calculate_contrast_improvement_index(
+    original_img: np.ndarray,
+    enhanced_img: np.ndarray,
+    window_size: int = 16
+) -> float:
+    """
+    Computes the Contrast Improvement Index (CII) between original and enhanced images.
+    
+    Formula:
+        CII = C_enhanced / (C_original + eps)
+    where C is the local patch-based contrast.
+    A CII > 1.0 indicates improvement in local contrast.
+
+    Args:
+        original_img (np.ndarray): Reference/original image.
+        enhanced_img (np.ndarray): Contrast-enhanced image.
+        window_size (int): Tile window dimension for local contrast evaluation (default: 16).
+
+    Returns:
+        float: Contrast Improvement Index (CII).
+    """
+    c_orig = calculate_image_contrast(original_img, window_size=window_size)
+    c_enh = calculate_image_contrast(enhanced_img, window_size=window_size)
+
+    eps = 1e-8
+    cii = c_enh / (c_orig + eps)
+    return float(cii)
+
+
+def evaluate_enhancement_metrics(
+    original_img: np.ndarray,
+    enhanced_img: np.ndarray,
+    window_size: int = 16
+) -> Dict[str, float]:
+    """
+    Computes comprehensive image quality & contrast enhancement metrics:
+    PSNR, SSIM, Shannon Entropy (Original vs Enhanced), Contrast Improvement Index (CII),
+    and Laplacian Variance (Edge Sharpness).
+
+    Args:
+        original_img (np.ndarray): Original/reference 2D image (uint8 or float).
+        enhanced_img (np.ndarray): Enhanced 2D image (uint8 or float).
+        window_size (int): Tile window size for CII evaluation (default: 16).
+
+    Returns:
+        Dict[str, float]: Dictionary of computed metric values.
+    """
+    if original_img.dtype != np.uint8:
+        orig_u8 = np.clip(original_img * 255.0 if original_img.max() <= 1.0 else original_img, 0, 255).astype(np.uint8)
+    else:
+        orig_u8 = original_img
+
+    if enhanced_img.dtype != np.uint8:
+        enh_u8 = np.clip(enhanced_img * 255.0 if enhanced_img.max() <= 1.0 else enhanced_img, 0, 255).astype(np.uint8)
+    else:
+        enh_u8 = enhanced_img
+
+    if orig_u8.ndim == 3 and orig_u8.shape[2] == 1:
+        orig_u8 = orig_u8.squeeze(axis=2)
+    if enh_u8.ndim == 3 and enh_u8.shape[2] == 1:
+        enh_u8 = enh_u8.squeeze(axis=2)
+
+    # 1. PSNR & SSIM
+    psnr_val = peak_signal_noise_ratio(orig_u8, enh_u8, data_range=255)
+    ssim_val = structural_similarity(orig_u8, enh_u8, data_range=255)
+
+    # 2. Shannon Entropy
+    orig_entropy = calculate_entropy(orig_u8)
+    enh_entropy = calculate_entropy(enh_u8)
+    delta_entropy = enh_entropy - orig_entropy
+
+    # 3. Contrast Improvement Index (CII)
+    cii_val = calculate_contrast_improvement_index(orig_u8, enh_u8, window_size=window_size)
+
+    # 4. Laplacian Variance (High-frequency edge energy)
+    lap_orig = float(cv2.Laplacian(orig_u8, cv2.CV_64F).var())
+    lap_enh = float(cv2.Laplacian(enh_u8, cv2.CV_64F).var())
+
+    return {
+        'PSNR': float(psnr_val),
+        'SSIM': float(ssim_val),
+        'Original_Entropy': float(orig_entropy),
+        'Enhanced_Entropy': float(enh_entropy),
+        'Entropy_Delta': float(delta_entropy),
+        'CII': float(cii_val),
+        'Laplacian_Variance_Original': lap_orig,
+        'Laplacian_Variance_Enhanced': lap_enh
+    }
+
+
+# =====================================================================
+# Main Mammogram Enhancement Pipeline Class
+# =====================================================================
 
 class MammogramEnhancer:
     """
     Production-ready image processor for medical mammography ROI crops.
     
-    Provides contrast enhancement via CLAHE and high-frequency edge sharpening
-    via Unsharp Masking for single images or image batches.
+    Provides contrast enhancement via Histogram Equalization (HE), CLAHE,
+    and high-frequency edge sharpening via Unsharp Masking (UM) for single
+    images or image batches, along with quantitative benchmarking utilities.
     """
 
     def __init__(
@@ -25,7 +224,8 @@ class MammogramEnhancer:
         tile_grid_size: Tuple[int, int] = (8, 8),
         blur_kernel_size: Tuple[int, int] = (5, 5),
         blur_sigma: float = 1.0,
-        sharpen_amount: float = 1.2
+        sharpen_amount: float = 1.2,
+        window_size: int = 16
     ) -> None:
         """
         Initialize the mammography contrast and sharpening pipeline parameters.
@@ -36,6 +236,7 @@ class MammogramEnhancer:
             blur_kernel_size (Tuple[int, int]): Gaussian kernel size for Unsharp Masking (default: (5, 5)).
             blur_sigma (float): Gaussian standard deviation for Unsharp Masking (default: 1.0).
             sharpen_amount (float): Scaling factor (alpha) for high-pass detail signal (default: 1.2).
+            window_size (int): Tile window size for CII evaluation (default: 16).
         """
         if clip_limit <= 0:
             raise ValueError(f"clip_limit must be positive, got {clip_limit}")
@@ -47,12 +248,15 @@ class MammogramEnhancer:
             raise ValueError(f"blur_sigma must be positive, got {blur_sigma}")
         if sharpen_amount < 0:
             raise ValueError(f"sharpen_amount must be non-negative, got {sharpen_amount}")
+        if window_size <= 0:
+            raise ValueError(f"window_size must be positive, got {window_size}")
 
         self.clip_limit = clip_limit
         self.tile_grid_size = tile_grid_size
         self.blur_kernel_size = blur_kernel_size
         self.blur_sigma = blur_sigma
         self.sharpen_amount = sharpen_amount
+        self.window_size = window_size
 
         # Pre-instantiate CLAHE object for optimal execution speed
         self._clahe = cv2.createCLAHE(
@@ -77,17 +281,33 @@ class MammogramEnhancer:
 
         return image
 
+    def apply_he(self, image: np.ndarray) -> np.ndarray:
+        """
+        Baseline Method: Apply Global Histogram Equalization (HE).
+        
+        Used purely to demonstrate global contrast spreading and highlight why CLAHE
+        is superior (avoids noise amplification in background and fatty tissue).
+        """
+        img_validated = self._validate_image(image)
+        return cv2.equalizeHist(img_validated)
+
     def apply_clahe(self, image: np.ndarray) -> np.ndarray:
         """
-        Step 1: Apply CLAHE contrast enhancement.
-        Prevents noise over-amplification in background/fatty tissue.
+        Primary Method: Apply Contrast Limited Adaptive Histogram Equalization (CLAHE).
+        
+        Divides image into contextual tiles and locally equalizes contrast with clipping
+        to avoid noise over-amplification in background/fatty tissue.
         """
         img_validated = self._validate_image(image)
         return self._clahe.apply(img_validated)
 
     def apply_unsharp_mask(self, image: np.ndarray) -> np.ndarray:
         """
-        Step 2: Apply Unsharp Masking (UM) to sharpen mass margins and microcalcifications.
+        Sharpening Method: Apply Unsharp Masking (UM) to sharpen mass margins and microcalcifications.
+        
+        Formula:
+            HighPass = Original - GaussianBlur(Original, ksize, sigma)
+            Output = Original + alpha * HighPass
         """
         img_validated = self._validate_image(image)
 
@@ -112,73 +332,240 @@ class MammogramEnhancer:
         # 5. Clip to 8-bit uint8 intensity range [0, 255]
         return np.clip(sharpened_float, 0, 255).astype(np.uint8)
 
-    def process_image(self, image: np.ndarray) -> np.ndarray:
-        """Execute Stage 5 pipeline (CLAHE followed by UM) on a single image."""
+    def apply_clahe_unsharp_mask(self, image: np.ndarray) -> np.ndarray:
+        """
+        Final Pipeline Method: Apply CLAHE followed by Unsharp Masking.
+        
+        Combines local contrast enhancement with edge definition sharpening.
+        """
         clahe_img = self.apply_clahe(image)
         return self.apply_unsharp_mask(clahe_img)
 
-    def process_batch(self, images: Union[np.ndarray, List[np.ndarray]]) -> np.ndarray:
-        """Process a batch of images shaped (N, H, W), (N, H, W, 1), or a list of 2D arrays."""
+    def process_image(self, image: np.ndarray, method: str = "clahe_unsharp_mask") -> np.ndarray:
+        """
+        Process a single mammogram ROI image using the selected method.
+
+        Args:
+            image (np.ndarray): 2D uint8 image (H, W) or (H, W, 1).
+            method (str): Technique to apply ('he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask').
+
+        Returns:
+            np.ndarray: Processed uint8 2D image.
+        """
+        valid_methods = ['he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask']
+        if method not in valid_methods:
+            raise ValueError(f"Invalid method '{method}'. Must be one of {valid_methods}")
+
+        if method == 'he':
+            return self.apply_he(image)
+        elif method == 'clahe':
+            return self.apply_clahe(image)
+        elif method == 'unsharp_mask':
+            return self.apply_unsharp_mask(image)
+        elif method == 'clahe_unsharp_mask':
+            return self.apply_clahe_unsharp_mask(image)
+
+    def process_batch(
+        self,
+        images: Union[np.ndarray, List[np.ndarray]],
+        method: str = "clahe_unsharp_mask"
+    ) -> np.ndarray:
+        """
+        Process a batch of images shaped (N, H, W), (N, H, W, 1), or a list of 2D arrays.
+        """
         if isinstance(images, np.ndarray):
             if images.ndim == 3:
-                processed_list = [self.process_image(img) for img in images]
+                processed_list = [self.process_image(img, method=method) for img in images]
                 return np.stack(processed_list, axis=0)
             elif images.ndim == 4 and images.shape[3] == 1:
-                processed_list = [self.process_image(img.squeeze(axis=2)) for img in images]
+                processed_list = [self.process_image(img.squeeze(axis=2), method=method) for img in images]
                 return np.stack(processed_list, axis=0)
             elif images.ndim == 2:
-                return self.process_image(images)
+                return self.process_image(images, method=method)
             else:
                 raise ValueError(f"Unsupported batch array shape: {images.shape}")
         elif isinstance(images, (list, tuple)):
             if len(images) == 0:
                 raise ValueError("Input image list is empty.")
-            processed_list = [self.process_image(img) for img in images]
+            processed_list = [self.process_image(img, method=method) for img in images]
             return np.stack(processed_list, axis=0)
         else:
             raise TypeError(f"Unsupported batch type: {type(images)}")
+
+    def compare_all_methods(
+        self,
+        image: np.ndarray
+    ) -> Tuple[Dict[str, np.ndarray], pd.DataFrame]:
+        """
+        Evaluates all Section 3 techniques against the original reference image:
+        1. Original (Reference)
+        2. Histogram Equalization (HE Baseline)
+        3. CLAHE (Local Adaptive)
+        4. Unsharp Masking (UM Sharpening)
+        5. Combined CLAHE + UM (Final Pipeline)
+
+        Returns:
+            Tuple[Dict[str, np.ndarray], pd.DataFrame]:
+                - Dict mapping method names to enhanced image arrays.
+                - DataFrame comparing quantitative evaluation metrics (PSNR, SSIM, Entropy, CII, Laplacian Var).
+        """
+        img_validated = self._validate_image(image)
+
+        he_img = self.apply_he(img_validated)
+        clahe_img = self.apply_clahe(img_validated)
+        um_img = self.apply_unsharp_mask(img_validated)
+        combined_img = self.apply_clahe_unsharp_mask(img_validated)
+
+        methods_dict = {
+            'Original': img_validated,
+            'HE': he_img,
+            'CLAHE': clahe_img,
+            'Unsharp_Mask': um_img,
+            'CLAHE_plus_UM': combined_img
+        }
+
+        records = []
+        for name, proc_img in methods_dict.items():
+            metrics = evaluate_enhancement_metrics(img_validated, proc_img, window_size=self.window_size)
+            row = {'Method': name, **metrics}
+            records.append(row)
+
+        df_comparison = pd.DataFrame(records)
+        return methods_dict, df_comparison
+
+    def parameter_sweep(
+        self,
+        image: np.ndarray,
+        clip_limits: Optional[List[float]] = None,
+        tile_grids: Optional[List[Tuple[int, int]]] = None,
+        blur_sigmas: Optional[List[float]] = None,
+        sharpen_amounts: Optional[List[float]] = None
+    ) -> pd.DataFrame:
+        """
+        Performs a systematic parameter sweep for CLAHE and Unsharp Masking tuning.
+        Supports Day 4-7 hyperparameter optimization schedule.
+
+        Args:
+            image (np.ndarray): 2D uint8 mammogram ROI.
+            clip_limits (Optional[List[float]]): List of CLAHE clip limits (e.g. [1.0, 2.0, 3.0, 4.0]).
+            tile_grids (Optional[List[Tuple[int, int]]]): List of grid sizes (e.g. [(4, 4), (8, 8), (16, 16)]).
+            blur_sigmas (Optional[List[float]]): List of Gaussian blur sigmas (e.g. [0.5, 1.0, 1.5]).
+            sharpen_amounts (Optional[List[float]]): List of sharpen alpha multipliers (e.g. [0.8, 1.2, 1.6]).
+
+        Returns:
+            pd.DataFrame: Table of evaluation metrics for all parameter configurations.
+        """
+        img_validated = self._validate_image(image)
+
+        if clip_limits is None:
+            clip_limits = [1.0, 2.0, 3.0, 4.0]
+        if tile_grids is None:
+            tile_grids = [(4, 4), (8, 8), (16, 16)]
+        if blur_sigmas is None:
+            blur_sigmas = [0.5, 1.0, 1.5]
+        if sharpen_amounts is None:
+            sharpen_amounts = [0.8, 1.2, 1.6]
+
+        records = []
+        for clip in clip_limits:
+            for grid in tile_grids:
+                for sigma in blur_sigmas:
+                    for amount in sharpen_amounts:
+                        enhancer = MammogramEnhancer(
+                            clip_limit=clip,
+                            tile_grid_size=grid,
+                            blur_kernel_size=self.blur_kernel_size,
+                            blur_sigma=sigma,
+                            sharpen_amount=amount,
+                            window_size=self.window_size
+                        )
+                        res = enhancer.apply_clahe_unsharp_mask(img_validated)
+                        metrics = evaluate_enhancement_metrics(img_validated, res, window_size=self.window_size)
+                        record = {
+                            'Clip_Limit': clip,
+                            'Tile_Grid': f"{grid[0]}x{grid[1]}",
+                            'Blur_Sigma': sigma,
+                            'Sharpen_Amount': amount,
+                            **metrics
+                        }
+                        records.append(record)
+
+        return pd.DataFrame(records)
 
     def visualize_enhancement(
         self,
         original_img: np.ndarray,
         save_path: Optional[str] = None,
-        figsize: Tuple[int, int] = (15, 5)
-    ) -> Tuple[np.ndarray, np.ndarray, plt.Figure]:
-        """Generate side-by-side comparison: Original vs. CLAHE vs. CLAHE+UM."""
-        img_validated = self._validate_image(original_img)
-        clahe_img = self.apply_clahe(img_validated)
-        final_img = self.apply_unsharp_mask(clahe_img)
+        figsize: Tuple[int, int] = (20, 5)
+    ) -> Tuple[Dict[str, np.ndarray], plt.Figure]:
+        """
+        Generates a 5-panel visual comparison displaying all Section 3 methods:
+        1. Original Denoised
+        2. Baseline Histogram Equalization (HE)
+        3. CLAHE (Local Adaptive Contrast)
+        4. Standalone Unsharp Masking (UM)
+        5. Combined CLAHE + Unsharp Masking (Final Pipeline)
 
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
-        axes[0].imshow(img_validated, cmap='gray', vmin=0, vmax=255)
-        axes[0].set_title("1. Original Denoised", fontsize=12, fontweight='bold')
-        axes[0].axis('off')
+        Args:
+            original_img (np.ndarray): Input 2D uint8 mammogram ROI.
+            save_path (Optional[str]): File path to save output figure.
+            figsize (Tuple[int, int]): Size of figure (default: (20, 5)).
 
-        axes[1].imshow(clahe_img, cmap='gray', vmin=0, vmax=255)
-        axes[1].set_title(f"2. CLAHE (clip={self.clip_limit}, grid={self.tile_grid_size})", fontsize=12, fontweight='bold')
-        axes[1].axis('off')
+        Returns:
+            Tuple[Dict[str, np.ndarray], plt.Figure]:
+                - Dictionary containing all enhanced images.
+                - Matplotlib Figure handle.
+        """
+        methods_dict, df_metrics = self.compare_all_methods(original_img)
 
-        axes[2].imshow(final_img, cmap='gray', vmin=0, vmax=255)
-        axes[2].set_title(f"3. CLAHE + Unsharp Mask (amount={self.sharpen_amount})", fontsize=12, fontweight='bold')
-        axes[2].axis('off')
+        fig, axes = plt.subplots(1, 5, figsize=figsize)
+
+        titles = [
+            "1. Original (Denoised)",
+            "2. Global HE (Baseline)",
+            f"3. CLAHE (clip={self.clip_limit})",
+            f"4. Unsharp Mask (α={self.sharpen_amount})",
+            f"5. Combined CLAHE+UM (Final)"
+        ]
+
+        keys = ['Original', 'HE', 'CLAHE', 'Unsharp_Mask', 'CLAHE_plus_UM']
+
+        for idx, key in enumerate(keys):
+            img = methods_dict[key]
+            axes[idx].imshow(img, cmap='gray', vmin=0, vmax=255)
+            row = df_metrics[df_metrics['Method'] == key].iloc[0]
+            
+            if key == 'Original':
+                subtitle = f"Entropy: {row['Original_Entropy']:.2f} bits"
+            else:
+                subtitle = f"Entropy: {row['Enhanced_Entropy']:.2f} | CII: {row['CII']:.2f}\nSSIM: {row['SSIM']:.3f} | PSNR: {row['PSNR']:.1f}dB"
+
+            axes[idx].set_title(f"{titles[idx]}\n{subtitle}", fontsize=10, fontweight='bold')
+            axes[idx].axis('off')
 
         plt.tight_layout()
         if save_path:
             plt.savefig(save_path, bbox_inches='tight', dpi=300)
 
-        return clahe_img, final_img, fig
+        return methods_dict, fig
 
 
-# Functional wrapper interface
+# =====================================================================
+# Functional Wrapper Interface
+# =====================================================================
+
 def process_mammogram_roi(
     image: np.ndarray,
+    method: str = "clahe_unsharp_mask",
     clip_limit: float = 2.0,
     tile_grid_size: Tuple[int, int] = (8, 8),
     blur_kernel_size: Tuple[int, int] = (5, 5),
     blur_sigma: float = 1.0,
     sharpen_amount: float = 1.2
 ) -> np.ndarray:
-    """Convenience function to process single images or batches."""
+    """
+    Convenience functional interface to process single images or batches with Stage 5 enhancement.
+    """
     enhancer = MammogramEnhancer(
         clip_limit=clip_limit,
         tile_grid_size=tile_grid_size,
@@ -187,5 +574,5 @@ def process_mammogram_roi(
         sharpen_amount=sharpen_amount
     )
     if image.ndim in (3, 4) and (image.shape[0] > 1 or image.ndim == 4):
-        return enhancer.process_batch(image)
-    return enhancer.process_image(image)
+        return enhancer.process_batch(image, method=method)
+    return enhancer.process_image(image, method=method)

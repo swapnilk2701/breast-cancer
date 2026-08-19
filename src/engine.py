@@ -1,18 +1,26 @@
 import os
 import pandas as pd
+import numpy as np
 from src.utils import (
     load_config,
     save_image,
     calculate_metrics,
     plot_metrics_comparison,
-    display_sample_images
+    display_sample_images,
+    display_sample_mse_images,
+    display_enhancement_comparison,
+    read_and_preprocess_image
 )
 from src.data_loader import get_image_paths, load_dataset_generator
-from src.model import add_noise, apply_denoising
+from src.model import add_noise, apply_denoising, apply_contrast_enhancement
+from src.pectoral_removal import PectoralMuscleRemover
+from src.intensity_normalization import IntensityNormalizer
+from src.contrast_sharpening.py import MammogramEnhancer
 
 def run_pipeline(config_path="config/config.yaml", max_images=None):
     """
-    Runs the end-to-end mammography denoising pipeline.
+    Runs the end-to-end mammography preprocessing, denoising, and contrast enhancement pipeline.
+    Preserves all noise and denoising stages while integrating Stage 5 contrast enhancement.
     """
     config = load_config(config_path)
     
@@ -23,14 +31,43 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     
     noisy_out_dir = os.path.join(processed_dir, 'noisy')
     denoised_out_dir = os.path.join(processed_dir, 'denoised')
+    enhanced_out_dir = os.path.join(processed_dir, 'enhanced')
+    pectoral_out_dir = os.path.join(processed_dir, 'pectoral_removed')
+    normalized_out_dir = os.path.join(processed_dir, 'normalized')
     
     os.makedirs(noisy_out_dir, exist_ok=True)
     os.makedirs(denoised_out_dir, exist_ok=True)
+    os.makedirs(enhanced_out_dir, exist_ok=True)
+    os.makedirs(pectoral_out_dir, exist_ok=True)
+    os.makedirs(normalized_out_dir, exist_ok=True)
     os.makedirs(results_dir, exist_ok=True)
     
     supported_formats = config['data']['supported_formats']
     image_size = tuple(config['data']['image_size'])
     
+    # Preprocessing initializers
+    pec_cfg = config.get('pectoral_removal', {})
+    pec_enabled = pec_cfg.get('enabled', True)
+    pec_remover = PectoralMuscleRemover(
+        roi_fraction_h=pec_cfg.get('roi_fraction_h', 0.5),
+        roi_fraction_w=pec_cfg.get('roi_fraction_w', 0.5),
+        fill_value=pec_cfg.get('fill_value', 0)
+    ) if pec_enabled else None
+
+    norm_cfg = config.get('intensity_normalization', {})
+    norm_enabled = norm_cfg.get('enabled', True)
+    normalizer = IntensityNormalizer(
+        method=norm_cfg.get('method', 'robust_min_max'),
+        p_low=norm_cfg.get('p_low', 1.0),
+        p_high=norm_cfg.get('p_high', 99.0),
+        target_min=norm_cfg.get('target_min', 0.0),
+        target_max=norm_cfg.get('target_max', 255.0)
+    ) if norm_enabled else None
+
+    enh_cfg = config.get('enhancement', {})
+    enh_enabled = enh_cfg.get('enabled', True)
+    enh_method = enh_cfg.get('method', 'clahe_unsharp_mask')
+
     # Noise and denoising types to evaluate
     noise_types = ['gaussian', 's&p', 'speckle', 'poisson', 'mixed_poisson_gaussian']
     denoising_methods = ['median', 'gaussian', 'wiener', 'bilateral', 'non_local_means', 'anscombe_wiener', 'adaptive_median', 'kuan']
@@ -48,13 +85,32 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     
     dataset_gen = load_dataset_generator(image_items, image_size)
     
-    for idx, (original_img, item) in enumerate(dataset_gen):
+    for idx, (raw_img, item) in enumerate(dataset_gen):
         class_folder = item["class"]
         image_name = item["image_name"]
         base_name = os.path.splitext(image_name)[0]
         
         print(f"[{idx+1}/{len(image_items)}] Processing {image_name} (Class: {class_folder})")
         
+        # Preprocessing Stage 1: Pectoral Muscle Removal
+        current_img = raw_img
+        if pec_enabled and pec_remover is not None:
+            raw_u8 = (np.clip(raw_img, 0, 1) * 255).astype(np.uint8)
+            pec_u8, _ = pec_remover.process_image(raw_u8)
+            current_img = pec_u8.astype(np.float64) / 255.0
+            pec_path = os.path.join(pectoral_out_dir, f"{base_name}_pectoral_removed.png")
+            save_image(current_img, pec_path)
+
+        # Preprocessing Stage 2: Intensity Normalization
+        if norm_enabled and normalizer is not None:
+            cur_u8 = (np.clip(current_img, 0, 1) * 255).astype(np.uint8)
+            norm_u8 = normalizer.normalize_image(cur_u8)
+            current_img = norm_u8.astype(np.float64) / 255.0
+            norm_path = os.path.join(normalized_out_dir, f"{base_name}_normalized.png")
+            save_image(current_img, norm_path)
+
+        original_img = current_img
+
         for noise_name in noise_types:
             # Inject noise
             noisy_img = add_noise(original_img, noise_name, config)
@@ -73,8 +129,17 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
                 denoised_path = os.path.join(denoised_out_dir, denoised_filename)
                 save_image(denoised_img, denoised_path)
                 
-                # Compute metrics
-                metrics = calculate_metrics(original_img, noisy_img, denoised_img)
+                # Apply Stage 5 Contrast Enhancement & Sharpening
+                enhanced_img = None
+                enhanced_path = None
+                if enh_enabled:
+                    enhanced_img = apply_contrast_enhancement(denoised_img, enh_method, config)
+                    enhanced_filename = f"{base_name}_{noise_name}_{method_name}_enhanced.png"
+                    enhanced_path = os.path.join(enhanced_out_dir, enhanced_filename)
+                    save_image(enhanced_img, enhanced_path)
+
+                # Compute metrics (includes noise, denoising, and enhancement metrics)
+                metrics = calculate_metrics(original_img, noisy_img, denoised_img, enhanced_img=enhanced_img)
                 
                 # Record result entry
                 row = {
@@ -86,6 +151,9 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
                     'Noisy Image Path': noisy_path,
                     'Denoised Image Path': denoised_path
                 }
+                if enhanced_path:
+                    row['Enhanced Image Path'] = enhanced_path
+
                 results_list.append(row)
                 
     if not results_list:
@@ -104,7 +172,14 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     
     # Compute summary statistics
     summary_metrics = ['PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original']
-    summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[summary_metrics].mean().reset_index()
+    if 'PSNR_Enhanced_vs_Original' in all_results_df.columns:
+        summary_metrics.extend([
+            'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original', 'MSE_Enhanced_vs_Original',
+            'Enhanced_Entropy', 'Entropy_Delta', 'CII'
+        ])
+
+    available_summary_metrics = [m for m in summary_metrics if m in all_results_df.columns]
+    summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[available_summary_metrics].mean().reset_index()
     summary_df_sorted = summary_df.sort_values(by=['Noise Type', 'PSNR_Denoised_vs_Original'], ascending=[True, False])
     
     summary_csv_path = os.path.join(results_dir, 'summary_statistics.csv')
@@ -116,7 +191,6 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     print(summary_df_sorted.to_string(index=False))
     print(f"\nSummary statistics saved to:\n  - {summary_csv_path}\n  - {summary_excel_path}")
     
-    # Generate and save comparison plots
     # Generate performance plots
     print("Generating performance plots...")
     psnr_plot_path = os.path.join(results_dir, 'psnr_comparison.png')
@@ -154,12 +228,22 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         'Average MSE', 
         save_path=os.path.join(results_dir, 'mse_comparison.png')
     )
+
+    if 'CII' in all_results_df.columns:
+        cii_plot_path = os.path.join(results_dir, 'cii_comparison.png')
+        plot_metrics_comparison(
+            all_results_df,
+            'CII',
+            'Average Contrast Improvement Index (CII) Comparison',
+            'Average CII',
+            save_path=cii_plot_path
+        )
+
     print(f"Plots saved in: {results_dir}")
     
     # Generate sample visualization for verification
     sample_row = all_results_df.iloc[0]
     original_img_path = os.path.join(raw_dir, sample_row['Class'], sample_row['Image Name'])
-    from src.utils import read_and_preprocess_image, display_sample_mse_images
     orig = read_and_preprocess_image(original_img_path, image_size)
     noisy = read_and_preprocess_image(sample_row['Noisy Image Path'], image_size)
     denoised = read_and_preprocess_image(sample_row['Denoised Image Path'], image_size)
@@ -181,8 +265,22 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
         )
         print(f"Sample MSE visualization saved to: {sample_mse_viz_path}")
 
-if __name__ == "__main__":
-    # Run on all images in the dataset
-    # run_pipeline(max_images=None)
-    run_pipeline(max_images=10)
+        # 5-panel enhancement comparison
+        enhancer = MammogramEnhancer()
+        denoised_u8 = (np.clip(denoised, 0, 1) * 255).astype(np.uint8)
+        enh_methods, _ = enhancer.compare_all_methods(denoised_u8)
+        enh_5panel_path = os.path.join(results_dir, 'sample_enhancement_comparison.png')
+        display_enhancement_comparison(
+            denoised_u8,
+            enh_methods['HE'],
+            enh_methods['CLAHE'],
+            enh_methods['Unsharp_Mask'],
+            enh_methods['CLAHE_plus_UM'],
+            title_suffix=f"({sample_row['Noise Type']} / {sample_row['Denoising Method']})",
+            save_path=enh_5panel_path
+        )
+        print(f"Sample 5-panel enhancement visualization saved to: {enh_5panel_path}")
 
+if __name__ == "__main__":
+    # Run on images in the dataset
+    run_pipeline(max_images=10)

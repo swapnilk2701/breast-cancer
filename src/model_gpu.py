@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from src.contrast_sharpening import MammogramEnhancer
+from src.contrast_sharpening.py import MammogramEnhancer
 from src.pectoral_removal import PectoralMuscleRemover
 from src.intensity_normalization import IntensityNormalizer
 
@@ -345,12 +345,25 @@ def apply_denoising_gpu(noisy_image_tensor, method, config):
         raise ValueError(f"Unsupported denoising method: {method}")
 
 # --- Stage 5: GPU Batch Contrast Enhancement & Sharpening ---
+def unsharp_mask_gpu(img_tensor, ksize=(5, 5), sigma=1.0, amount=1.2):
+    """
+    Applies Unsharp Masking sharpening directly on GPU tensor batch (B, 1, H, W).
+    """
+    blurred = gaussian_filter_gpu(img_tensor, ksize=ksize, sigma=sigma)
+    high_pass = img_tensor - blurred
+    sharpened = img_tensor + amount * high_pass
+    return torch.clamp(sharpened, 0.0, 1.0)
+
 def apply_contrast_sharpening_gpu(denoised_tensor, config):
     """
-    Applies Stage 5 Contrast Enhancement (CLAHE) and Sharpening (Unsharp Masking) to batched PyTorch tensors (B, 1, H, W).
-    Configurable clip limit (2.0), tile grid size (8, 8), blur kernel (5, 5), sigma (1.0), sharpen strength (1.2).
+    Applies Stage 5 Contrast Enhancement ('he', 'clahe', 'unsharp_mask', 'clahe_unsharp_mask')
+    to batched PyTorch tensors (B, 1, H, W).
     """
     enh_cfg = config.get('enhancement', {})
+    if not enh_cfg.get('enabled', True):
+        return denoised_tensor
+
+    method = enh_cfg.get('method', 'clahe_unsharp_mask')
     clip_limit = enh_cfg.get('clahe', {}).get('clip_limit', 2.0)
     tile_grid = tuple(enh_cfg.get('clahe', {}).get('tile_grid_size', [8, 8]))
     ksize = tuple(enh_cfg.get('unsharp_mask', {}).get('kernel_size', [5, 5]))
@@ -367,7 +380,7 @@ def apply_contrast_sharpening_gpu(denoised_tensor, config):
 
     device = denoised_tensor.device
     np_batch = (torch.clamp(denoised_tensor, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
-    enhanced_np = enhancer.process_batch(np_batch)  # Returns (B, H, W) uint8
+    enhanced_np = enhancer.process_batch(np_batch, method=method)  # Returns (B, H, W) uint8
     enhanced_tensor = torch.from_numpy(enhanced_np.astype(np.float32) / 255.0).unsqueeze(1).to(device)
     return enhanced_tensor
 
@@ -449,7 +462,7 @@ def normalize_intensity_gpu(image_tensor, config):
 
     return norm_tensor
 
-# --- GPU Batch Image Quality Metrics (MSE, PSNR, SSIM) ---
+# --- GPU Batch Image Quality Metrics (MSE, PSNR, SSIM, Entropy, CII) ---
 def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
     """
     Computes Structural Similarity Index (SSIM) for a batch of images (B, 1, H, W) on GPU.
@@ -489,9 +502,11 @@ def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
 
 def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhanced_batch=None):
     """
-    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM, Laplacian Variance) entirely on GPU.
+    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM, Entropy, CII) entirely on GPU/CPU.
     Returns: List of metric dicts, one per image in the batch.
     """
+    from src.contrast_sharpening import calculate_entropy, calculate_contrast_improvement_index
+
     if orig_batch.ndim == 3:
         orig_batch = orig_batch.unsqueeze(1)
     if noisy_batch.ndim == 3:
@@ -525,6 +540,8 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhance
     ssim_noisy_np = ssim_noisy.cpu().numpy()
     ssim_denoised_np = ssim_denoised.cpu().numpy()
 
+    orig_np = (torch.clamp(orig_batch, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
+
     if enhanced_batch is not None:
         if enhanced_batch.ndim == 3:
             enhanced_batch = enhanced_batch.unsqueeze(1)
@@ -535,13 +552,18 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhance
         mse_enhanced_np = mse_enhanced.cpu().numpy()
         psnr_enhanced_np = psnr_enhanced.cpu().numpy()
         ssim_enhanced_np = ssim_enhanced.cpu().numpy()
+        enh_np = (torch.clamp(enhanced_batch, 0.0, 1.0).detach().cpu().squeeze(1).numpy() * 255.0).astype(np.uint8)
 
     metrics_list = []
     for i in range(B):
+        orig_img_i = orig_np[i] if orig_np.ndim == 3 else orig_np
+        orig_ent = calculate_entropy(orig_img_i)
+
         row_metrics = {
             'Original_Mean': float(orig_mean[i]),
             'Original_Median': float(orig_median[i]),
             'Original_StdDev': float(orig_std[i]),
+            'Original_Entropy': float(orig_ent),
             'MSE_Noisy_vs_Original': float(mse_noisy_np[i]),
             'MSE_Denoised_vs_Original': float(mse_denoised_np[i]),
             'PSNR_Noisy_vs_Original': float(psnr_noisy_np[i]),
@@ -550,12 +572,19 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhance
             'SSIM_Denoised_vs_Original': float(ssim_denoised_np[i]),
         }
         if enhanced_batch is not None:
+            enh_img_i = enh_np[i] if enh_np.ndim == 3 else enh_np
+            enh_ent = calculate_entropy(enh_img_i)
+            cii_val = calculate_contrast_improvement_index(orig_img_i, enh_img_i)
             row_metrics.update({
                 'MSE_Enhanced_vs_Original': float(mse_enhanced_np[i]),
                 'PSNR_Enhanced_vs_Original': float(psnr_enhanced_np[i]),
                 'SSIM_Enhanced_vs_Original': float(ssim_enhanced_np[i]),
+                'Enhanced_Entropy': float(enh_ent),
+                'Entropy_Delta': float(enh_ent - orig_ent),
+                'CII': float(cii_val),
             })
         metrics_list.append(row_metrics)
 
     return metrics_list
+
 

@@ -1,4 +1,4 @@
-# Breast Cancer Mammography Denoising AI Project
+# Breast Cancer Mammography Denoising AI Project.
 
 This repository contains an end-to-end modular pipeline designed to evaluate and compare the performance of image denoising techniques on mammography datasets under various synthetic noise conditions. The pipeline supports both **CPU** execution (via NumPy/OpenCV/SciPy) and **GPU** acceleration (via PyTorch CUDA operations).
 

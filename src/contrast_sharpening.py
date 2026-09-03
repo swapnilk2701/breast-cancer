@@ -31,6 +31,45 @@ from skimage.metrics import peak_signal_noise_ratio, structural_similarity
 # Quantitative Metrics Functions for Contrast Enhancement Evaluation
 # =====================================================================
 
+def extract_roi_masks(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float, float]:
+    """
+    Extracts lesion/dense tissue ROI (foreground) and surrounding healthy tissue ROI (background).
+    Formula parameters:
+        μ_f (μ_ROI): Mean intensity of lesion/foreground ROI.
+        μ_b (μ_background): Mean intensity of surrounding healthy background ROI.
+        σ_background: Standard deviation of intensity of healthy background ROI.
+    Returns:
+        Tuple[fg_mask, bg_mask, mu_f, mu_b, sigma_b]
+    """
+    img_float = image.astype(np.float64)
+    if img_float.max() > 1.0:
+        img_float = img_float / 255.0
+
+    # Non-black breast tissue mask (ignore pure background outside breast)
+    breast_mask = img_float > 0.02
+    if not np.any(breast_mask):
+        breast_mask = np.ones_like(img_float, dtype=bool)
+
+    breast_pixels = img_float[breast_mask]
+    thresh = float(np.percentile(breast_pixels, 75))  # Top 25% intensity inside breast tissue as candidate ROI
+
+    fg_mask = breast_mask & (img_float >= thresh)
+    bg_mask = breast_mask & (img_float < thresh)
+
+    if not np.any(fg_mask):
+        fg_mask = breast_mask
+    if not np.any(bg_mask):
+        bg_mask = breast_mask
+
+    mu_f = float(np.mean(img_float[fg_mask]))
+    mu_b = float(np.mean(img_float[bg_mask]))
+    sigma_b = float(np.std(img_float[bg_mask]))
+    if sigma_b < 1e-6:
+        sigma_b = 1e-6
+
+    return fg_mask, bg_mask, mu_f, mu_b, sigma_b
+
+
 def calculate_entropy(image: np.ndarray) -> float:
     """
     Computes the Shannon Entropy (information content) of an image in bits.
@@ -58,7 +97,10 @@ def calculate_entropy(image: np.ndarray) -> float:
 
     # Compute intensity histogram probability distribution
     hist, _ = np.histogram(img_uint8.ravel(), bins=256, range=(0, 256))
-    prob = hist.astype(np.float64) / hist.sum()
+    total = hist.sum()
+    if total == 0:
+        return 0.0
+    prob = hist.astype(np.float64) / total
 
     # Filter out zero probabilities to avoid log2(0)
     prob_non_zero = prob[prob > 0]
@@ -67,13 +109,33 @@ def calculate_entropy(image: np.ndarray) -> float:
     return float(entropy_val)
 
 
+def calculate_contrast_roi(image: np.ndarray) -> float:
+    """
+    Computes ROI-based Michelson/Weber contrast:
+        C_ROI = |μ_f - μ_b| / (μ_b + eps)
+    """
+    _, _, mu_f, mu_b, _ = extract_roi_masks(image)
+    return float(abs(mu_f - mu_b) / (mu_b + 1e-8))
+
+
+def calculate_cii_roi(original_img: np.ndarray, enhanced_img: np.ndarray) -> float:
+    """
+    Computes ROI-based Contrast Improvement Index:
+        CII_ROI = C_processed / (C_original + eps)
+    where C = |μ_f - μ_b| / μ_b
+    """
+    c_orig = calculate_contrast_roi(original_img)
+    c_enh = calculate_contrast_roi(enhanced_img)
+    return float(c_enh / (c_orig + 1e-8))
+
+
 def calculate_image_contrast(image: np.ndarray, window_size: int = 16) -> float:
     """
     Computes local patch-based Michelson/Weber contrast for a mammogram image.
     
-    Divides the image into non-overlapping or sliding windows and computes:
+    Divides the image into non-overlapping windows and computes:
         C_patch = (I_max - I_min) / (I_max + I_min + eps)
-    and returns the mean contrast across all non-background windows.
+    and returns the mean contrast across all windows.
 
     Args:
         image (np.ndarray): 2D grayscale image.
@@ -121,20 +183,11 @@ def calculate_contrast_improvement_index(
     window_size: int = 16
 ) -> float:
     """
-    Computes the Contrast Improvement Index (CII) between original and enhanced images.
+    Computes Patch-based Contrast Improvement Index (CII_Patch) between original and enhanced images.
     
     Formula:
-        CII = C_enhanced / (C_original + eps)
-    where C is the local patch-based contrast.
-    A CII > 1.0 indicates improvement in local contrast.
-
-    Args:
-        original_img (np.ndarray): Reference/original image.
-        enhanced_img (np.ndarray): Contrast-enhanced image.
-        window_size (int): Tile window dimension for local contrast evaluation (default: 16).
-
-    Returns:
-        float: Contrast Improvement Index (CII).
+        CII_Patch = C_patch,enhanced / (C_patch,original + eps)
+    where C_patch is the local patch-based contrast.
     """
     c_orig = calculate_image_contrast(original_img, window_size=window_size)
     c_enh = calculate_image_contrast(enhanced_img, window_size=window_size)
@@ -144,23 +197,56 @@ def calculate_contrast_improvement_index(
     return float(cii)
 
 
+def calculate_cii_patch(
+    original_img: np.ndarray,
+    enhanced_img: np.ndarray,
+    window_size: int = 16
+) -> float:
+    """Alias for calculate_contrast_improvement_index."""
+    return calculate_contrast_improvement_index(original_img, enhanced_img, window_size=window_size)
+
+
+def calculate_snr(image: np.ndarray) -> float:
+    """
+    Computes Signal-to-Noise Ratio (SNR):
+        SNR = μ_ROI / σ_background
+    """
+    _, _, mu_f, _, sigma_b = extract_roi_masks(image)
+    return float(mu_f / (sigma_b + 1e-8))
+
+
+def calculate_cnr(image: np.ndarray) -> float:
+    """
+    Computes Contrast-to-Noise Ratio (CNR):
+        CNR = |μ_ROI - μ_background| / σ_background
+    """
+    _, _, mu_f, mu_b, sigma_b = extract_roi_masks(image)
+    return float(abs(mu_f - mu_b) / (sigma_b + 1e-8))
+
+
 def evaluate_enhancement_metrics(
     original_img: np.ndarray,
     enhanced_img: np.ndarray,
     window_size: int = 16
-) -> Dict[str, float]:
+) -> Dict[str, Union[float, str]]:
     """
     Computes comprehensive image quality & contrast enhancement metrics:
-    PSNR, SSIM, Shannon Entropy (Original vs Enhanced), Contrast Improvement Index (CII),
-    and Laplacian Variance (Edge Sharpness).
+    - CII_ROI: ROI-based Contrast Improvement Index
+    - CII_Patch: Patch-based Contrast Improvement Index
+    - PSNR: Peak Signal-to-Noise Ratio
+    - SSIM: Structural Similarity Index Measure
+    - SNR: Signal-to-Noise Ratio (Original, Enhanced, Change %)
+    - CNR: Contrast-to-Noise Ratio (Original, Enhanced, Change %)
+    - Shannon Entropy (Original, Enhanced, Change %)
+    - Status indicators (Improved / Degraded)
 
     Args:
         original_img (np.ndarray): Original/reference 2D image (uint8 or float).
         enhanced_img (np.ndarray): Enhanced 2D image (uint8 or float).
-        window_size (int): Tile window size for CII evaluation (default: 16).
+        window_size (int): Tile window size for CII_Patch evaluation (default: 16).
 
     Returns:
-        Dict[str, float]: Dictionary of computed metric values.
+        Dict[str, Union[float, str]]: Dictionary of computed metric values and status.
     """
     if original_img.dtype != np.uint8:
         orig_u8 = np.clip(original_img * 255.0 if original_img.max() <= 1.0 else original_img, 0, 255).astype(np.uint8)
@@ -178,30 +264,52 @@ def evaluate_enhancement_metrics(
         enh_u8 = enh_u8.squeeze(axis=2)
 
     # 1. PSNR & SSIM
-    psnr_val = peak_signal_noise_ratio(orig_u8, enh_u8, data_range=255)
-    ssim_val = structural_similarity(orig_u8, enh_u8, data_range=255)
+    psnr_val = float(peak_signal_noise_ratio(orig_u8, enh_u8, data_range=255))
+    ssim_val = float(structural_similarity(orig_u8, enh_u8, data_range=255))
 
     # 2. Shannon Entropy
     orig_entropy = calculate_entropy(orig_u8)
     enh_entropy = calculate_entropy(enh_u8)
-    delta_entropy = enh_entropy - orig_entropy
+    entropy_change_pct = float((enh_entropy - orig_entropy) / (orig_entropy + 1e-8) * 100.0)
 
-    # 3. Contrast Improvement Index (CII)
-    cii_val = calculate_contrast_improvement_index(orig_u8, enh_u8, window_size=window_size)
+    # 3. Dual CII (ROI-based & Patch-based)
+    cii_roi_val = calculate_cii_roi(orig_u8, enh_u8)
+    cii_patch_val = calculate_cii_patch(orig_u8, enh_u8, window_size=window_size)
 
-    # 4. Laplacian Variance (High-frequency edge energy)
+    # 4. SNR & CNR
+    snr_orig = calculate_snr(orig_u8)
+    snr_enh = calculate_snr(enh_u8)
+    snr_change_pct = float((snr_enh - snr_orig) / (snr_orig + 1e-8) * 100.0)
+
+    cnr_orig = calculate_cnr(orig_u8)
+    cnr_enh = calculate_cnr(enh_u8)
+    cnr_change_pct = float((cnr_enh - cnr_orig) / (cnr_orig + 1e-8) * 100.0)
+
+    # 5. Laplacian Variance
     lap_orig = float(cv2.Laplacian(orig_u8, cv2.CV_64F).var())
     lap_enh = float(cv2.Laplacian(enh_u8, cv2.CV_64F).var())
 
     return {
-        'PSNR': float(psnr_val),
-        'SSIM': float(ssim_val),
-        'Original_Entropy': float(orig_entropy),
-        'Enhanced_Entropy': float(enh_entropy),
-        'Entropy_Delta': float(delta_entropy),
-        'CII': float(cii_val),
+        'PSNR': psnr_val,
+        'SSIM': ssim_val,
+        'CII_ROI': cii_roi_val,
+        'CII_Patch': cii_patch_val,
+        'Original_Entropy': orig_entropy,
+        'Enhanced_Entropy': enh_entropy,
+        'Entropy_Change_Pct': entropy_change_pct,
+        'SNR_Original': snr_orig,
+        'SNR_Enhanced': snr_enh,
+        'SNR_Change_Pct': snr_change_pct,
+        'CNR_Original': cnr_orig,
+        'CNR_Enhanced': cnr_enh,
+        'CNR_Change_Pct': cnr_change_pct,
         'Laplacian_Variance_Original': lap_orig,
-        'Laplacian_Variance_Enhanced': lap_enh
+        'Laplacian_Variance_Enhanced': lap_enh,
+        'CII_ROI_Status': 'Improved' if cii_roi_val > 1.0 else 'Degraded',
+        'CII_Patch_Status': 'Improved' if cii_patch_val > 1.0 else 'Degraded',
+        'SNR_Status': 'Improved' if snr_change_pct > 0 else 'Degraded',
+        'CNR_Status': 'Improved' if cnr_change_pct > 0 else 'Degraded',
+        'Entropy_Status': 'Improved' if entropy_change_pct > 0 else 'Degraded'
     }
 
 

@@ -502,10 +502,16 @@ def ssim_gpu_batch(img1, img2, window_size=11, sigma=1.5, data_range=1.0):
 
 def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhanced_batch=None):
     """
-    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM, Entropy, CII) entirely on GPU/CPU.
+    Calculates batch image metrics (Mean, Median, StdDev, MSE, PSNR, SSIM, Entropy, CII_ROI, CII_Patch, SNR, CNR) entirely on GPU/CPU.
     Returns: List of metric dicts, one per image in the batch.
     """
-    from src.contrast_sharpening import calculate_entropy, calculate_contrast_improvement_index
+    from src.contrast_sharpening import (
+        calculate_entropy,
+        calculate_cii_roi,
+        calculate_cii_patch,
+        calculate_snr,
+        calculate_cnr
+    )
 
     if orig_batch.ndim == 3:
         orig_batch = orig_batch.unsqueeze(1)
@@ -558,12 +564,16 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhance
     for i in range(B):
         orig_img_i = orig_np[i] if orig_np.ndim == 3 else orig_np
         orig_ent = calculate_entropy(orig_img_i)
+        orig_snr = calculate_snr(orig_img_i)
+        orig_cnr = calculate_cnr(orig_img_i)
 
         row_metrics = {
             'Original_Mean': float(orig_mean[i]),
             'Original_Median': float(orig_median[i]),
             'Original_StdDev': float(orig_std[i]),
             'Original_Entropy': float(orig_ent),
+            'Original_SNR': float(orig_snr),
+            'Original_CNR': float(orig_cnr),
             'MSE_Noisy_vs_Original': float(mse_noisy_np[i]),
             'MSE_Denoised_vs_Original': float(mse_denoised_np[i]),
             'PSNR_Noisy_vs_Original': float(psnr_noisy_np[i]),
@@ -574,14 +584,34 @@ def calculate_metrics_gpu_batch(orig_batch, noisy_batch, denoised_batch, enhance
         if enhanced_batch is not None:
             enh_img_i = enh_np[i] if enh_np.ndim == 3 else enh_np
             enh_ent = calculate_entropy(enh_img_i)
-            cii_val = calculate_contrast_improvement_index(orig_img_i, enh_img_i)
+            enh_snr = calculate_snr(enh_img_i)
+            enh_cnr = calculate_cnr(enh_img_i)
+            cii_roi_val = calculate_cii_roi(orig_img_i, enh_img_i)
+            cii_patch_val = calculate_cii_patch(orig_img_i, enh_img_i)
+
+            ent_change_pct = float((enh_ent - orig_ent) / (orig_ent + 1e-8) * 100.0)
+            snr_change_pct = float((enh_snr - orig_snr) / (orig_snr + 1e-8) * 100.0)
+            cnr_change_pct = float((enh_cnr - orig_cnr) / (orig_cnr + 1e-8) * 100.0)
+
             row_metrics.update({
                 'MSE_Enhanced_vs_Original': float(mse_enhanced_np[i]),
                 'PSNR_Enhanced_vs_Original': float(psnr_enhanced_np[i]),
                 'SSIM_Enhanced_vs_Original': float(ssim_enhanced_np[i]),
+                'CII_ROI': float(cii_roi_val),
+                'CII_Patch': float(cii_patch_val),
+                'CII': float(cii_patch_val),
                 'Enhanced_Entropy': float(enh_ent),
+                'Entropy_Change_Pct': ent_change_pct,
                 'Entropy_Delta': float(enh_ent - orig_ent),
-                'CII': float(cii_val),
+                'SNR_Enhanced': float(enh_snr),
+                'SNR_Change_Pct': snr_change_pct,
+                'CNR_Enhanced': float(enh_cnr),
+                'CNR_Change_Pct': cnr_change_pct,
+                'CII_ROI_Status': 'Improved' if cii_roi_val > 1.0 else 'Degraded',
+                'CII_Patch_Status': 'Improved' if cii_patch_val > 1.0 else 'Degraded',
+                'SNR_Status': 'Improved' if snr_change_pct > 0 else 'Degraded',
+                'CNR_Status': 'Improved' if cnr_change_pct > 0 else 'Degraded',
+                'Entropy_Status': 'Improved' if ent_change_pct > 0 else 'Degraded'
             })
         metrics_list.append(row_metrics)
 

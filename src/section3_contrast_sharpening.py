@@ -172,11 +172,43 @@ def apply_clahe_um(
 # 2. QUANTITATIVE METRICS ENGINE
 # =====================================================================
 
+def extract_roi_masks(image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, float, float]:
+    """
+    Extracts lesion/dense tissue ROI (foreground) and surrounding healthy tissue ROI (background).
+    Returns: Tuple[fg_mask, bg_mask, mu_f, mu_b, sigma_b]
+    """
+    img_float = image.astype(np.float64)
+    if img_float.max() > 1.0:
+        img_float = img_float / 255.0
+
+    breast_mask = img_float > 0.02
+    if not np.any(breast_mask):
+        breast_mask = np.ones_like(img_float, dtype=bool)
+
+    breast_pixels = img_float[breast_mask]
+    thresh = float(np.percentile(breast_pixels, 75))
+
+    fg_mask = breast_mask & (img_float >= thresh)
+    bg_mask = breast_mask & (img_float < thresh)
+
+    if not np.any(fg_mask):
+        fg_mask = breast_mask
+    if not np.any(bg_mask):
+        bg_mask = breast_mask
+
+    mu_f = float(np.mean(img_float[fg_mask]))
+    mu_b = float(np.mean(img_float[bg_mask]))
+    sigma_b = float(np.std(img_float[bg_mask]))
+    if sigma_b < 1e-6:
+        sigma_b = 1e-6
+
+    return fg_mask, bg_mask, mu_f, mu_b, sigma_b
+
+
 def calculate_entropy(image: np.ndarray) -> float:
     """
     Computes Shannon Entropy (information content / detail richness) in bits.
-    Formula:
-        H = - sum_{i=0}^{255} p(i) * log2(p(i))
+    Formula: H = - sum_{i=0}^{255} p(i) * log2(p(i))
     """
     img_u8 = image if image.dtype == np.uint8 else np.clip(image * 255.0, 0, 255).astype(np.uint8)
     hist, _ = np.histogram(img_u8.ravel(), bins=256, range=(0, 256))
@@ -188,12 +220,21 @@ def calculate_entropy(image: np.ndarray) -> float:
     return float(-np.sum(prob_non_zero * np.log2(prob_non_zero)))
 
 
+def calculate_contrast_roi(image: np.ndarray) -> float:
+    """Computes ROI-based contrast: C_ROI = |μ_f - μ_b| / (μ_b + eps)."""
+    _, _, mu_f, mu_b, _ = extract_roi_masks(image)
+    return float(abs(mu_f - mu_b) / (mu_b + 1e-8))
+
+
+def calculate_cii_roi(processed_img: np.ndarray, reference_img: np.ndarray) -> float:
+    """Computes ROI-based Contrast Improvement Index: CII_ROI = C_processed / (C_reference + eps)."""
+    c_ref = calculate_contrast_roi(reference_img)
+    c_proc = calculate_contrast_roi(processed_img)
+    return float(c_proc / (c_ref + 1e-8))
+
+
 def calculate_image_contrast(image: np.ndarray, window_size: int = 16) -> float:
-    """
-    Computes local patch-based Michelson contrast.
-    Formula:
-        C_patch = (I_max - I_min) / (I_max + I_min + eps)
-    """
+    """Computes patch-based Michelson contrast (C_patch = (I_max - I_min) / (I_max + I_min + eps))."""
     img_f64 = image.astype(np.float64) / 255.0 if image.dtype == np.uint8 else image.astype(np.float64)
     H, W = img_f64.shape[:2]
     contrasts = []
@@ -213,19 +254,36 @@ def calculate_image_contrast(image: np.ndarray, window_size: int = 16) -> float:
     return float(np.mean(contrasts))
 
 
+def calculate_cii_patch(
+    processed_img: np.ndarray,
+    reference_img: np.ndarray,
+    window_size: int = 16
+) -> float:
+    """Computes Patch-based Contrast Improvement Index: CII_Patch = C_patch,processed / (C_patch,reference + eps)."""
+    c_ref = calculate_image_contrast(reference_img, window_size=window_size)
+    c_proc = calculate_image_contrast(processed_img, window_size=window_size)
+    return float(c_proc / (c_ref + 1e-8))
+
+
 def calculate_cii(
     processed_img: np.ndarray,
     reference_img: np.ndarray,
     window_size: int = 16
 ) -> float:
-    """
-    Computes Contrast Improvement Index (CII) relative to reference image.
-    Formula:
-        CII = C_processed / (C_reference + 1e-8)
-    """
-    c_ref = calculate_image_contrast(reference_img, window_size=window_size)
-    c_proc = calculate_image_contrast(processed_img, window_size=window_size)
-    return float(c_proc / (c_ref + 1e-8))
+    """Alias for calculate_cii_patch."""
+    return calculate_cii_patch(processed_img, reference_img, window_size=window_size)
+
+
+def calculate_snr(image: np.ndarray) -> float:
+    """Computes Signal-to-Noise Ratio (SNR = μ_ROI / σ_background)."""
+    _, _, mu_f, _, sigma_b = extract_roi_masks(image)
+    return float(mu_f / (sigma_b + 1e-8))
+
+
+def calculate_cnr(image: np.ndarray) -> float:
+    """Computes Contrast-to-Noise Ratio (CNR = |μ_ROI - μ_background| / σ_background)."""
+    _, _, mu_f, mu_b, sigma_b = extract_roi_masks(image)
+    return float(abs(mu_f - mu_b) / (sigma_b + 1e-8))
 
 
 def compute_metrics_for_method(
@@ -233,42 +291,75 @@ def compute_metrics_for_method(
     reference_denoised_img: np.ndarray,
     method_name: str,
     window_size: int = 16
-) -> Dict[str, float]:
+) -> Dict[str, Any]:
     """
-    Computes PSNR, SSIM, Entropy, and CII.
-    For the reference image ('Adaptive_Median') itself vs itself:
-      - PSNR = float('nan')
-      - SSIM = 1.0
-      - CII = 1.0
-    For enhanced methods (HE, CLAHE, CLAHE_UM):
-      - PSNR is computed relative to Adaptive Median reference
-      - SSIM is computed relative to Adaptive Median reference
-      - CII is computed relative to Adaptive Median reference
-      - Entropy is computed directly on processed image
+    Computes PSNR, SSIM, Entropy, CII_ROI, CII_Patch, SNR, CNR, Change %, and Improved/Degraded indicators.
     """
-    entropy_val = calculate_entropy(processed_img)
+    ref_u8 = reference_denoised_img if reference_denoised_img.dtype == np.uint8 else (reference_denoised_img * 255).astype(np.uint8)
+    proc_u8 = processed_img if processed_img.dtype == np.uint8 else (processed_img * 255).astype(np.uint8)
+
+    ent_ref = calculate_entropy(ref_u8)
+    ent_proc = calculate_entropy(proc_u8)
+    ent_change_pct = float((ent_proc - ent_ref) / (ent_ref + 1e-8) * 100.0)
+
+    snr_ref = calculate_snr(ref_u8)
+    snr_proc = calculate_snr(proc_u8)
+    snr_change_pct = float((snr_proc - snr_ref) / (snr_ref + 1e-8) * 100.0)
+
+    cnr_ref = calculate_cnr(ref_u8)
+    cnr_proc = calculate_cnr(proc_u8)
+    cnr_change_pct = float((cnr_proc - cnr_ref) / (cnr_ref + 1e-8) * 100.0)
 
     if method_name == 'Adaptive_Median':
         return {
             'psnr': float('nan'),
             'ssim': 1.0,
-            'entropy': entropy_val,
-            'cii': 1.0
+            'cii_roi': 1.0,
+            'cii_patch': 1.0,
+            'cii': 1.0,
+            'entropy': ent_ref,
+            'entropy_orig': ent_ref,
+            'entropy_proc': ent_ref,
+            'entropy_change_pct': 0.0,
+            'snr_orig': snr_ref,
+            'snr_proc': snr_ref,
+            'snr_change_pct': 0.0,
+            'cnr_orig': cnr_ref,
+            'cnr_proc': cnr_ref,
+            'cnr_change_pct': 0.0,
+            'cii_roi_status': 'Reference',
+            'cii_patch_status': 'Reference',
+            'snr_status': 'Reference',
+            'cnr_status': 'Reference',
+            'entropy_status': 'Reference'
         }
-
-    # Ensure identical shapes and uint8
-    ref_u8 = reference_denoised_img if reference_denoised_img.dtype == np.uint8 else (reference_denoised_img * 255).astype(np.uint8)
-    proc_u8 = processed_img if processed_img.dtype == np.uint8 else (processed_img * 255).astype(np.uint8)
 
     psnr_val = float(peak_signal_noise_ratio(ref_u8, proc_u8, data_range=255))
     ssim_val = float(structural_similarity(ref_u8, proc_u8, data_range=255))
-    cii_val = calculate_cii(proc_u8, ref_u8, window_size=window_size)
+    cii_roi_val = calculate_cii_roi(proc_u8, ref_u8)
+    cii_patch_val = calculate_cii_patch(proc_u8, ref_u8, window_size=window_size)
 
     return {
         'psnr': psnr_val,
         'ssim': ssim_val,
-        'entropy': entropy_val,
-        'cii': cii_val
+        'cii_roi': cii_roi_val,
+        'cii_patch': cii_patch_val,
+        'cii': cii_patch_val,
+        'entropy': ent_proc,
+        'entropy_orig': ent_ref,
+        'entropy_proc': ent_proc,
+        'entropy_change_pct': ent_change_pct,
+        'snr_orig': snr_ref,
+        'snr_proc': snr_proc,
+        'snr_change_pct': snr_change_pct,
+        'cnr_orig': cnr_ref,
+        'cnr_proc': cnr_proc,
+        'cnr_change_pct': cnr_change_pct,
+        'cii_roi_status': 'Improved' if cii_roi_val > 1.0 else 'Degraded',
+        'cii_patch_status': 'Improved' if cii_patch_val > 1.0 else 'Degraded',
+        'snr_status': 'Improved' if snr_change_pct > 0 else 'Degraded',
+        'cnr_status': 'Improved' if cnr_change_pct > 0 else 'Degraded',
+        'entropy_status': 'Improved' if ent_change_pct > 0 else 'Degraded'
     }
 
 
@@ -483,7 +574,7 @@ class Section3ContrastSharpeningPipeline:
                     for sigma in um_sigmas:
                         for amount in um_amounts:
                             config_id += 1
-                            psnrs, ssims, entropies, ciis = [], [], [], []
+                            psnrs, ssims, entropies, ciis_roi, ciis_patch, snrs, cnrs = [], [], [], [], [], [], []
 
                             for rec, den_img in loaded_samples:
                                 enhanced = apply_clahe_um(
@@ -497,8 +588,11 @@ class Section3ContrastSharpeningPipeline:
                                 m = compute_metrics_for_method(enhanced, den_img, method_name='CLAHE_UM')
                                 psnrs.append(m['psnr'])
                                 ssims.append(m['ssim'])
-                                entropies.append(m['entropy'])
-                                ciis.append(m['cii'])
+                                entropies.append(m['entropy_proc'])
+                                ciis_roi.append(m['cii_roi'])
+                                ciis_patch.append(m['cii_patch'])
+                                snrs.append(m['snr_proc'])
+                                cnrs.append(m['cnr_proc'])
 
                             sweep_records.append({
                                 'config_id': config_id,
@@ -511,35 +605,43 @@ class Section3ContrastSharpeningPipeline:
                                 'mean_psnr': float(np.mean(psnrs)),
                                 'mean_ssim': float(np.mean(ssims)),
                                 'mean_entropy': float(np.mean(entropies)),
-                                'mean_cii': float(np.mean(ciis))
+                                'mean_cii_roi': float(np.mean(ciis_roi)),
+                                'mean_cii_patch': float(np.mean(ciis_patch)),
+                                'mean_cii': float(np.mean(ciis_patch)),
+                                'mean_snr': float(np.mean(snrs)),
+                                'mean_cnr': float(np.mean(cnrs))
                             })
 
         df_sweep = pd.DataFrame(sweep_records)
 
         # Multi-objective composite score ranking
         max_ssim = df_sweep['mean_ssim'].max()
-        max_cii = df_sweep['mean_cii'].max()
+        max_cii = df_sweep['mean_cii_patch'].max()
         max_ent = df_sweep['mean_entropy'].max()
         max_psnr = df_sweep['mean_psnr'].max()
 
         df_sweep['composite_score'] = (
             0.35 * (df_sweep['mean_ssim'] / max_ssim) +
-            0.35 * (df_sweep['mean_cii'] / max_cii) +
+            0.35 * (df_sweep['mean_cii_patch'] / max_cii) +
             0.20 * (df_sweep['mean_entropy'] / max_ent) +
             0.10 * (df_sweep['mean_psnr'] / max_psnr)
         )
         df_sweep = df_sweep.sort_values(by='composite_score', ascending=False).reset_index(drop=True)
         df_sweep['rank'] = df_sweep.index + 1
 
-        # Save main parameter sweep CSV
+        # Save main parameter sweep CSV and Excel
         sweep_csv = os.path.join(self.results_dir, "contrast_parameter_sweep.csv")
+        sweep_excel = os.path.join(self.results_dir, "contrast_parameter_sweep.xlsx")
         df_sweep.to_csv(sweep_csv, index=False)
-        print(f"Parameter sweep results saved to: {sweep_csv}")
+        df_sweep.to_excel(sweep_excel, index=False)
 
-        # Save Top 10 Configurations in parameter_tuning folder
+        # Save Top 10 Configurations in parameter_tuning folder (CSV & Excel)
         top10_csv = os.path.join(self.tuning_dir, "top10_configurations.csv")
+        top10_excel = os.path.join(self.tuning_dir, "top10_configurations.xlsx")
         df_sweep.head(10).to_csv(top10_csv, index=False)
-        print(f"Top 10 configurations saved to: {top10_csv}")
+        df_sweep.head(10).to_excel(top10_excel, index=False)
+        print(f"Parameter sweep results saved to:\n  - {sweep_csv}\n  - {sweep_excel}")
+        print(f"Top 10 configurations saved to:\n  - {top10_csv}\n  - {top10_excel}")
 
         # Lock in top-ranked parameters
         best_cfg = df_sweep.iloc[0]
@@ -557,7 +659,7 @@ class Section3ContrastSharpeningPipeline:
         print(f"  Unsharp Mask kernel: {self.selected_um_kernel}")
         print(f"  Unsharp Mask sigma: {self.selected_um_sigma}")
         print(f"  Unsharp Mask amount: {self.selected_um_amount}")
-        print(f"  Mean SSIM: {best_cfg['mean_ssim']:.4f} | Mean CII: {best_cfg['mean_cii']:.4f} | Mean Entropy: {best_cfg['mean_entropy']:.4f} | Mean PSNR: {best_cfg['mean_psnr']:.2f} dB\n")
+        print(f"  Mean SSIM: {best_cfg['mean_ssim']:.4f} | Mean CII (ROI): {best_cfg['mean_cii_roi']:.4f} | Mean CII (Patch): {best_cfg['mean_cii_patch']:.4f} | Mean SNR: {best_cfg['mean_snr']:.4f} | Mean CNR: {best_cfg['mean_cnr']:.4f} | Mean Entropy: {best_cfg['mean_entropy']:.4f} | Mean PSNR: {best_cfg['mean_psnr']:.2f} dB\n")
 
         # Generate Visual Sweep Plots in parameter_tuning folder
         self._generate_tuning_visualizations(loaded_samples[0][1], df_sweep)
@@ -574,9 +676,10 @@ class Section3ContrastSharpeningPipeline:
         for idx, clip in enumerate(clip_tests):
             enh = apply_clahe(sample_img, clip_limit=clip, tile_grid_size=(8, 8))
             ent = calculate_entropy(enh)
-            cii = calculate_cii(enh, sample_img)
+            cii_r = calculate_cii_roi(enh, sample_img)
+            cii_p = calculate_cii_patch(enh, sample_img)
             axes[idx].imshow(enh, cmap='gray', vmin=0, vmax=255)
-            axes[idx].set_title(f"CLAHE clipLimit = {clip}\nEntropy: {ent:.2f} | CII: {cii:.2f}", fontsize=10, fontweight='bold')
+            axes[idx].set_title(f"CLAHE clipLimit = {clip}\nEntropy: {ent:.2f} | CII-ROI: {cii_r:.2f} | CII-Patch: {cii_p:.2f}", fontsize=9, fontweight='bold')
             axes[idx].axis('off')
         plt.suptitle("Parameter Tuning: CLAHE clipLimit Sweep", fontsize=12, fontweight='bold')
         plt.tight_layout()
@@ -590,43 +693,68 @@ class Section3ContrastSharpeningPipeline:
         for idx, amt in enumerate(amounts):
             enh = apply_unsharp_mask(clahe_base, kernel_size=self.selected_um_kernel, sigma=self.selected_um_sigma, amount=amt)
             ent = calculate_entropy(enh)
-            cii = calculate_cii(enh, sample_img)
+            cii_r = calculate_cii_roi(enh, sample_img)
+            cii_p = calculate_cii_patch(enh, sample_img)
             axes[idx].imshow(enh, cmap='gray', vmin=0, vmax=255)
-            axes[idx].set_title(f"Unsharp Mask Amount = {amt}\nEntropy: {ent:.2f} | CII: {cii:.2f}", fontsize=10, fontweight='bold')
+            axes[idx].set_title(f"Unsharp Mask Amount = {amt}\nEntropy: {ent:.2f} | CII-ROI: {cii_r:.2f} | CII-Patch: {cii_p:.2f}", fontsize=9, fontweight='bold')
             axes[idx].axis('off')
         plt.suptitle(f"Parameter Tuning: Unsharp Mask Sharpen Amount Sweep (CLAHE clip={self.selected_clip_limit})", fontsize=12, fontweight='bold')
         plt.tight_layout()
         plt.savefig(os.path.join(self.tuning_dir, "unsharp_mask_amount_comparison.png"), dpi=300)
         plt.close()
 
-        # 3. Response curves across parameter configurations
-        fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+        # 3. Response curves across parameter configurations (CII ROI, CII Patch, SNR, CNR, SSIM, Entropy)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10))
         clip_grouped = df_sweep.groupby('clip_limit').mean(numeric_only=True)
         amt_grouped = df_sweep.groupby('um_amount').mean(numeric_only=True)
 
-        axes[0].plot(clip_grouped.index, clip_grouped['mean_cii'], marker='o', color='#4A90E2', label='CII vs clipLimit')
-        axes[0].plot(amt_grouped.index, amt_grouped['mean_cii'], marker='s', color='#E94E77', label='CII vs UM amount')
-        axes[0].set_title("Contrast Improvement Index (CII) Response", fontweight='bold')
-        axes[0].set_xlabel("Parameter Value")
-        axes[0].set_ylabel("Mean CII")
-        axes[0].legend()
-        axes[0].grid(True, linestyle='--', alpha=0.7)
+        axes[0, 0].plot(clip_grouped.index, clip_grouped['mean_cii_roi'], marker='o', color='#4A90E2', label='CII ROI vs clipLimit')
+        axes[0, 0].plot(amt_grouped.index, amt_grouped['mean_cii_roi'], marker='s', color='#E94E77', label='CII ROI vs UM amount')
+        axes[0, 0].set_title("CII ROI-based Response", fontweight='bold')
+        axes[0, 0].set_xlabel("Parameter Value")
+        axes[0, 0].set_ylabel("Mean CII (ROI)")
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, linestyle='--', alpha=0.7)
 
-        axes[1].plot(clip_grouped.index, clip_grouped['mean_entropy'], marker='o', color='#4A90E2', label='Entropy vs clipLimit')
-        axes[1].plot(amt_grouped.index, amt_grouped['mean_entropy'], marker='s', color='#E94E77', label='Entropy vs UM amount')
-        axes[1].set_title("Shannon Entropy Response", fontweight='bold')
-        axes[1].set_xlabel("Parameter Value")
-        axes[1].set_ylabel("Mean Entropy (bits)")
-        axes[1].legend()
-        axes[1].grid(True, linestyle='--', alpha=0.7)
+        axes[0, 1].plot(clip_grouped.index, clip_grouped['mean_cii_patch'], marker='o', color='#4A90E2', label='CII Patch vs clipLimit')
+        axes[0, 1].plot(amt_grouped.index, amt_grouped['mean_cii_patch'], marker='s', color='#E94E77', label='CII Patch vs UM amount')
+        axes[0, 1].set_title("CII Patch-based Response", fontweight='bold')
+        axes[0, 1].set_xlabel("Parameter Value")
+        axes[0, 1].set_ylabel("Mean CII (Patch)")
+        axes[0, 1].legend()
+        axes[0, 1].grid(True, linestyle='--', alpha=0.7)
 
-        axes[2].plot(clip_grouped.index, clip_grouped['mean_ssim'], marker='o', color='#4A90E2', label='SSIM vs clipLimit')
-        axes[2].plot(amt_grouped.index, amt_grouped['mean_ssim'], marker='s', color='#E94E77', label='SSIM vs UM amount')
-        axes[2].set_title("Structural Similarity (SSIM) Response", fontweight='bold')
-        axes[2].set_xlabel("Parameter Value")
-        axes[2].set_ylabel("Mean SSIM")
-        axes[2].legend()
-        axes[2].grid(True, linestyle='--', alpha=0.7)
+        axes[0, 2].plot(clip_grouped.index, clip_grouped['mean_snr'], marker='o', color='#4A90E2', label='SNR vs clipLimit')
+        axes[0, 2].plot(amt_grouped.index, amt_grouped['mean_snr'], marker='s', color='#E94E77', label='SNR vs UM amount')
+        axes[0, 2].set_title("Signal-to-Noise Ratio (SNR) Response", fontweight='bold')
+        axes[0, 2].set_xlabel("Parameter Value")
+        axes[0, 2].set_ylabel("Mean SNR")
+        axes[0, 2].legend()
+        axes[0, 2].grid(True, linestyle='--', alpha=0.7)
+
+        axes[1, 0].plot(clip_grouped.index, clip_grouped['mean_cnr'], marker='o', color='#4A90E2', label='CNR vs clipLimit')
+        axes[1, 0].plot(amt_grouped.index, amt_grouped['mean_cnr'], marker='s', color='#E94E77', label='CNR vs UM amount')
+        axes[1, 0].set_title("Contrast-to-Noise Ratio (CNR) Response", fontweight='bold')
+        axes[1, 0].set_xlabel("Parameter Value")
+        axes[1, 0].set_ylabel("Mean CNR")
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, linestyle='--', alpha=0.7)
+
+        axes[1, 1].plot(clip_grouped.index, clip_grouped['mean_entropy'], marker='o', color='#4A90E2', label='Entropy vs clipLimit')
+        axes[1, 1].plot(amt_grouped.index, amt_grouped['mean_entropy'], marker='s', color='#E94E77', label='Entropy vs UM amount')
+        axes[1, 1].set_title("Shannon Entropy Response", fontweight='bold')
+        axes[1, 1].set_xlabel("Parameter Value")
+        axes[1, 1].set_ylabel("Mean Entropy (bits)")
+        axes[1, 1].legend()
+        axes[1, 1].grid(True, linestyle='--', alpha=0.7)
+
+        axes[1, 2].plot(clip_grouped.index, clip_grouped['mean_ssim'], marker='o', color='#4A90E2', label='SSIM vs clipLimit')
+        axes[1, 2].plot(amt_grouped.index, amt_grouped['mean_ssim'], marker='s', color='#E94E77', label='SSIM vs UM amount')
+        axes[1, 2].set_title("Structural Similarity (SSIM) Response", fontweight='bold')
+        axes[1, 2].set_xlabel("Parameter Value")
+        axes[1, 2].set_ylabel("Mean SSIM")
+        axes[1, 2].legend()
+        axes[1, 2].grid(True, linestyle='--', alpha=0.7)
 
         plt.suptitle("Section 3 Hyperparameter Tuning Response Curves", fontsize=13, fontweight='bold')
         plt.tight_layout()
@@ -834,7 +962,23 @@ class Section3ContrastSharpeningPipeline:
                 'psnr': np.nan,
                 'ssim': m_den['ssim'],
                 'entropy': m_den['entropy'],
-                'cii': m_den['cii']
+                'entropy_orig': m_den['entropy_orig'],
+                'entropy_proc': m_den['entropy_proc'],
+                'entropy_change_pct': 0.0,
+                'cii_roi': 1.0,
+                'cii_patch': 1.0,
+                'cii': 1.0,
+                'snr_orig': m_den['snr_orig'],
+                'snr_proc': m_den['snr_proc'],
+                'snr_change_pct': 0.0,
+                'cnr_orig': m_den['cnr_orig'],
+                'cnr_proc': m_den['cnr_proc'],
+                'cnr_change_pct': 0.0,
+                'cii_roi_status': 'Reference',
+                'cii_patch_status': 'Reference',
+                'snr_status': 'Reference',
+                'cnr_status': 'Reference',
+                'entropy_status': 'Reference'
             })
 
             # 2. Method B: Histogram Equalization (HE Baseline)
@@ -862,7 +1006,23 @@ class Section3ContrastSharpeningPipeline:
                 'psnr': m_he['psnr'],
                 'ssim': m_he['ssim'],
                 'entropy': m_he['entropy'],
-                'cii': m_he['cii']
+                'entropy_orig': m_he['entropy_orig'],
+                'entropy_proc': m_he['entropy_proc'],
+                'entropy_change_pct': m_he['entropy_change_pct'],
+                'cii_roi': m_he['cii_roi'],
+                'cii_patch': m_he['cii_patch'],
+                'cii': m_he['cii'],
+                'snr_orig': m_he['snr_orig'],
+                'snr_proc': m_he['snr_proc'],
+                'snr_change_pct': m_he['snr_change_pct'],
+                'cnr_orig': m_he['cnr_orig'],
+                'cnr_proc': m_he['cnr_proc'],
+                'cnr_change_pct': m_he['cnr_change_pct'],
+                'cii_roi_status': m_he['cii_roi_status'],
+                'cii_patch_status': m_he['cii_patch_status'],
+                'snr_status': m_he['snr_status'],
+                'cnr_status': m_he['cnr_status'],
+                'entropy_status': m_he['entropy_status']
             })
 
             # 3. Method C: CLAHE (Primary Method)
@@ -890,7 +1050,23 @@ class Section3ContrastSharpeningPipeline:
                 'psnr': m_clahe['psnr'],
                 'ssim': m_clahe['ssim'],
                 'entropy': m_clahe['entropy'],
-                'cii': m_clahe['cii']
+                'entropy_orig': m_clahe['entropy_orig'],
+                'entropy_proc': m_clahe['entropy_proc'],
+                'entropy_change_pct': m_clahe['entropy_change_pct'],
+                'cii_roi': m_clahe['cii_roi'],
+                'cii_patch': m_clahe['cii_patch'],
+                'cii': m_clahe['cii'],
+                'snr_orig': m_clahe['snr_orig'],
+                'snr_proc': m_clahe['snr_proc'],
+                'snr_change_pct': m_clahe['snr_change_pct'],
+                'cnr_orig': m_clahe['cnr_orig'],
+                'cnr_proc': m_clahe['cnr_proc'],
+                'cnr_change_pct': m_clahe['cnr_change_pct'],
+                'cii_roi_status': m_clahe['cii_roi_status'],
+                'cii_patch_status': m_clahe['cii_patch_status'],
+                'snr_status': m_clahe['snr_status'],
+                'cnr_status': m_clahe['cnr_status'],
+                'entropy_status': m_clahe['entropy_status']
             })
 
             # 4. Method D: CLAHE + Unsharp Masking (Final Pipeline)
@@ -932,7 +1108,23 @@ class Section3ContrastSharpeningPipeline:
                 'psnr': m_clahe_um['psnr'],
                 'ssim': m_clahe_um['ssim'],
                 'entropy': m_clahe_um['entropy'],
-                'cii': m_clahe_um['cii']
+                'entropy_orig': m_clahe_um['entropy_orig'],
+                'entropy_proc': m_clahe_um['entropy_proc'],
+                'entropy_change_pct': m_clahe_um['entropy_change_pct'],
+                'cii_roi': m_clahe_um['cii_roi'],
+                'cii_patch': m_clahe_um['cii_patch'],
+                'cii': m_clahe_um['cii'],
+                'snr_orig': m_clahe_um['snr_orig'],
+                'snr_proc': m_clahe_um['snr_proc'],
+                'snr_change_pct': m_clahe_um['snr_change_pct'],
+                'cnr_orig': m_clahe_um['cnr_orig'],
+                'cnr_proc': m_clahe_um['cnr_proc'],
+                'cnr_change_pct': m_clahe_um['cnr_change_pct'],
+                'cii_roi_status': m_clahe_um['cii_roi_status'],
+                'cii_patch_status': m_clahe_um['cii_patch_status'],
+                'snr_status': m_clahe_um['snr_status'],
+                'cnr_status': m_clahe_um['cnr_status'],
+                'entropy_status': m_clahe_um['entropy_status']
             })
 
             processed_count += 1
@@ -941,10 +1133,12 @@ class Section3ContrastSharpeningPipeline:
 
         df_results = pd.DataFrame(results_list)
         results_csv = os.path.join(self.results_dir, "contrast_sharpening_results.csv")
+        results_excel = os.path.join(self.results_dir, "contrast_sharpening_results.xlsx")
         df_results.to_csv(results_csv, index=False)
-        print(f"\nDetailed Section 3 results saved to: {results_csv}")
+        df_results.to_excel(results_excel, index=False)
+        print(f"\nDetailed Section 3 results saved to:\n  - {results_csv}\n  - {results_excel}")
 
-        # Compute Summary Statistics
+        # Compute Summary Statistics (Mean ± Std Dev)
         summary_rows = []
         methods = ['Adaptive_Median', 'HE', 'CLAHE', 'CLAHE_UM']
         subsets = [('Overall', df_results), ('Benign', df_results[df_results['class'] == 'benign']), ('Malignant', df_results[df_results['class'] == 'malignant'])]
@@ -957,28 +1151,68 @@ class Section3ContrastSharpeningPipeline:
                 if m_df.empty:
                     continue
 
+                mean_psnr = float(m_df['psnr'].dropna().mean()) if not m_df['psnr'].dropna().empty else np.nan
+                std_psnr = float(m_df['psnr'].dropna().std()) if not m_df['psnr'].dropna().empty else np.nan
+
+                mean_ssim = float(m_df['ssim'].mean())
+                std_ssim = float(m_df['ssim'].std()) if len(m_df) > 1 else 0.0
+
+                mean_ent = float(m_df['entropy_proc'].mean())
+                std_ent = float(m_df['entropy_proc'].std()) if len(m_df) > 1 else 0.0
+
+                mean_cii_roi = float(m_df['cii_roi'].mean())
+                std_cii_roi = float(m_df['cii_roi'].std()) if len(m_df) > 1 else 0.0
+
+                mean_cii_patch = float(m_df['cii_patch'].mean())
+                std_cii_patch = float(m_df['cii_patch'].std()) if len(m_df) > 1 else 0.0
+
+                mean_snr_proc = float(m_df['snr_proc'].mean())
+                std_snr_proc = float(m_df['snr_proc'].std()) if len(m_df) > 1 else 0.0
+
+                mean_cnr_proc = float(m_df['cnr_proc'].mean())
+                std_cnr_proc = float(m_df['cnr_proc'].std()) if len(m_df) > 1 else 0.0
+
                 summary_rows.append({
                     'subset': subset_name,
                     'method': m,
                     'num_images': len(m_df),
-                    'mean_psnr': float(m_df['psnr'].dropna().mean()) if not m_df['psnr'].dropna().empty else np.nan,
-                    'std_psnr': float(m_df['psnr'].dropna().std()) if not m_df['psnr'].dropna().empty else np.nan,
-                    'mean_ssim': float(m_df['ssim'].mean()),
-                    'std_ssim': float(m_df['ssim'].std()),
-                    'mean_entropy': float(m_df['entropy'].mean()),
-                    'std_entropy': float(m_df['entropy'].std()),
-                    'mean_cii': float(m_df['cii'].mean()),
-                    'std_cii': float(m_df['cii'].std())
+                    'mean_psnr': mean_psnr,
+                    'std_psnr': std_psnr,
+                    'mean_ssim': mean_ssim,
+                    'std_ssim': std_ssim,
+                    'mean_entropy': mean_ent,
+                    'std_entropy': std_ent,
+                    'mean_cii_roi': mean_cii_roi,
+                    'std_cii_roi': std_cii_roi,
+                    'mean_cii_patch': mean_cii_patch,
+                    'std_cii_patch': std_cii_patch,
+                    'mean_cii': mean_cii_patch,
+                    'std_cii': std_cii_patch,
+                    'mean_snr': mean_snr_proc,
+                    'std_snr': std_snr_proc,
+                    'mean_cnr': mean_cnr_proc,
+                    'std_cnr': std_cnr_proc,
+                    'cii_roi_mean_std': f"{mean_cii_roi:.4f} ± {std_cii_roi:.4f}",
+                    'cii_patch_mean_std': f"{mean_cii_patch:.4f} ± {std_cii_patch:.4f}",
+                    'psnr_mean_std': f"{mean_psnr:.2f} ± {std_psnr:.2f}" if not np.isnan(mean_psnr) else "Ref",
+                    'ssim_mean_std': f"{mean_ssim:.4f} ± {std_ssim:.4f}",
+                    'snr_mean_std': f"{mean_snr_proc:.4f} ± {std_snr_proc:.4f}",
+                    'cnr_mean_std': f"{mean_cnr_proc:.4f} ± {std_cnr_proc:.4f}",
+                    'entropy_mean_std': f"{mean_ent:.4f} ± {std_ent:.4f}",
+                    'cii_roi_status': 'Improved' if mean_cii_roi > 1.0 else ('Reference' if m == 'Adaptive_Median' else 'Degraded'),
+                    'cii_patch_status': 'Improved' if mean_cii_patch > 1.0 else ('Reference' if m == 'Adaptive_Median' else 'Degraded')
                 })
 
         df_summary = pd.DataFrame(summary_rows)
         summary_csv = os.path.join(self.results_dir, "contrast_sharpening_summary.csv")
+        summary_excel = os.path.join(self.results_dir, "contrast_sharpening_summary.xlsx")
         df_summary.to_csv(summary_csv, index=False)
-        print(f"Aggregated summary statistics saved to: {summary_csv}")
+        df_summary.to_excel(summary_excel, index=False)
+        print(f"Aggregated summary statistics saved to:\n  - {summary_csv}\n  - {summary_excel}")
 
         print("\n--- Final Section 3 Summary Statistics (Overall) ---")
         overall_summary = df_summary[df_summary['subset'] == 'Overall']
-        print(overall_summary[['method', 'num_images', 'mean_psnr', 'mean_ssim', 'mean_entropy', 'mean_cii']].to_string(index=False))
+        print(overall_summary[['method', 'num_images', 'mean_psnr', 'mean_ssim', 'mean_entropy', 'mean_cii_roi', 'mean_cii_patch']].to_string(index=False))
 
         # Generate plots
         self.generate_metric_plots(df_summary, df_results)
@@ -993,7 +1227,7 @@ class Section3ContrastSharpeningPipeline:
     # -----------------------------------------------------------------
     def generate_metric_plots(self, df_summary: pd.DataFrame, df_results: pd.DataFrame) -> None:
         """
-        Generates bar charts for PSNR, SSIM, Entropy, and CII.
+        Generates separate bar charts for CII_ROI, CII_Patch, SNR, CNR, PSNR, SSIM, and Entropy.
         """
         print(f"\n--- Generating Metric Comparison Plots ---")
         overall_df = df_summary[df_summary['subset'] == 'Overall'].set_index('method')
@@ -1012,20 +1246,72 @@ class Section3ContrastSharpeningPipeline:
         plt.savefig(os.path.join(self.plots_dir, "entropy_comparison.png"), dpi=300)
         plt.close()
 
-        # 2. CII Plot
+        # 2. CII ROI-based Plot
         plt.figure(figsize=(8, 5))
-        ciis = [overall_df.loc[m, 'mean_cii'] for m in methods if m in overall_df.index]
-        plt.bar(methods, ciis, color=colors)
+        ciis_roi = [overall_df.loc[m, 'mean_cii_roi'] for m in methods if m in overall_df.index]
+        plt.bar(methods, ciis_roi, color=colors)
         plt.axhline(1.0, color='black', linestyle='--', linewidth=1, label="Adaptive Median Baseline (1.0)")
-        plt.title("Contrast Improvement Index (CII) Comparison", fontsize=12, fontweight='bold')
-        plt.ylabel("CII Ratio (vs Adaptive Median)", fontsize=11)
+        plt.title("Contrast Improvement Index (CII ROI-based) Comparison", fontsize=12, fontweight='bold')
+        plt.ylabel("CII Ratio (|μ_f - μ_b| / μ_b vs Ref)", fontsize=11)
+        plt.legend()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, "cii_roi_comparison.png"), dpi=300)
+        plt.close()
+
+        # 3. CII Patch-based Plot
+        plt.figure(figsize=(8, 5))
+        ciis_patch = [overall_df.loc[m, 'mean_cii_patch'] for m in methods if m in overall_df.index]
+        plt.bar(methods, ciis_patch, color=colors)
+        plt.axhline(1.0, color='black', linestyle='--', linewidth=1, label="Adaptive Median Baseline (1.0)")
+        plt.title("Contrast Improvement Index (CII Patch-based) Comparison", fontsize=12, fontweight='bold')
+        plt.ylabel("CII Ratio (16x16 Michelson Patch vs Ref)", fontsize=11)
+        plt.legend()
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, "cii_patch_comparison.png"), dpi=300)
+        plt.close()
+
+        # Combined CII Comparison Plot (ROI vs Patch side-by-side)
+        plt.figure(figsize=(10, 5))
+        x = np.arange(len(methods))
+        width = 0.35
+        plt.bar(x - width/2, ciis_roi, width, label='CII ROI-based', color='#4A90E2')
+        plt.bar(x + width/2, ciis_patch, width, label='CII Patch-based', color='#F5A623')
+        plt.axhline(1.0, color='black', linestyle='--', linewidth=1, label="Baseline (1.0)")
+        plt.title("CII ROI-based vs Patch-based Comparison Across Methods", fontsize=12, fontweight='bold')
+        plt.xlabel("Method")
+        plt.ylabel("Contrast Improvement Index Ratio")
+        plt.xticks(x, methods)
         plt.legend()
         plt.grid(axis='y', linestyle='--', alpha=0.7)
         plt.tight_layout()
         plt.savefig(os.path.join(self.plots_dir, "cii_comparison.png"), dpi=300)
         plt.close()
 
-        # 3. SSIM Plot
+        # 4. SNR Plot
+        plt.figure(figsize=(8, 5))
+        snrs = [overall_df.loc[m, 'mean_snr'] for m in methods if m in overall_df.index]
+        plt.bar(methods, snrs, color=colors)
+        plt.title("Signal-to-Noise Ratio (SNR = μ_ROI / σ_background) Comparison", fontsize=12, fontweight='bold')
+        plt.ylabel("Average SNR", fontsize=11)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, "snr_comparison.png"), dpi=300)
+        plt.close()
+
+        # 5. CNR Plot
+        plt.figure(figsize=(8, 5))
+        cnrs = [overall_df.loc[m, 'mean_cnr'] for m in methods if m in overall_df.index]
+        plt.bar(methods, cnrs, color=colors)
+        plt.title("Contrast-to-Noise Ratio (CNR = |μ_ROI - μ_bg| / σ_bg) Comparison", fontsize=12, fontweight='bold')
+        plt.ylabel("Average CNR", fontsize=11)
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(self.plots_dir, "cnr_comparison.png"), dpi=300)
+        plt.close()
+
+        # 6. SSIM Plot
         plt.figure(figsize=(8, 5))
         ssims = [overall_df.loc[m, 'mean_ssim'] for m in methods if m in overall_df.index]
         plt.bar(methods, ssims, color=colors)
@@ -1037,7 +1323,7 @@ class Section3ContrastSharpeningPipeline:
         plt.savefig(os.path.join(self.plots_dir, "ssim_comparison.png"), dpi=300)
         plt.close()
 
-        # 4. PSNR Plot
+        # 7. PSNR Plot
         enh_methods = ['HE', 'CLAHE', 'CLAHE_UM']
         psnrs = [overall_df.loc[m, 'mean_psnr'] for m in enh_methods if m in overall_df.index and not np.isnan(overall_df.loc[m, 'mean_psnr'])]
         if psnrs:
@@ -1104,12 +1390,12 @@ Visual parameter comparison panels and tuning response curves are documented in 
 ## 5. Quantitative Results
 
 ### Overall Dataset Summary Table
-| Method | Number of Images | Mean PSNR (dB) | Mean SSIM | Mean Entropy (bits) | Mean CII |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Adaptive Median (Baseline)** | {overall.loc['Adaptive_Median', 'num_images'] if 'Adaptive_Median' in overall.index else 0} | Reference (N/A) | {overall.loc['Adaptive_Median', 'mean_ssim']:.4f} | {overall.loc['Adaptive_Median', 'mean_entropy']:.4f} | 1.0000 |
-| **Global HE (Baseline)** | {overall.loc['HE', 'num_images'] if 'HE' in overall.index else 0} | {overall.loc['HE', 'mean_psnr']:.2f} ± {overall.loc['HE', 'std_psnr']:.2f} | {overall.loc['HE', 'mean_ssim']:.4f} ± {overall.loc['HE', 'std_ssim']:.4f} | {overall.loc['HE', 'mean_entropy']:.4f} ± {overall.loc['HE', 'std_entropy']:.4f} | {overall.loc['HE', 'mean_cii']:.4f} ± {overall.loc['HE', 'std_cii']:.4f} |
-| **CLAHE (Primary)** | {overall.loc['CLAHE', 'num_images'] if 'CLAHE' in overall.index else 0} | {overall.loc['CLAHE', 'mean_psnr']:.2f} ± {overall.loc['CLAHE', 'std_psnr']:.2f} | {overall.loc['CLAHE', 'mean_ssim']:.4f} ± {overall.loc['CLAHE', 'std_ssim']:.4f} | {overall.loc['CLAHE', 'mean_entropy']:.4f} ± {overall.loc['CLAHE', 'std_entropy']:.4f} | {overall.loc['CLAHE', 'mean_cii']:.4f} ± {overall.loc['CLAHE', 'std_cii']:.4f} |
-| **CLAHE + UM (Final)** | {overall.loc['CLAHE_UM', 'num_images'] if 'CLAHE_UM' in overall.index else 0} | {overall.loc['CLAHE_UM', 'mean_psnr']:.2f} ± {overall.loc['CLAHE_UM', 'std_psnr']:.2f} | {overall.loc['CLAHE_UM', 'mean_ssim']:.4f} ± {overall.loc['CLAHE_UM', 'std_ssim']:.4f} | {overall.loc['CLAHE_UM', 'mean_entropy']:.4f} ± {overall.loc['CLAHE_UM', 'std_entropy']:.4f} | {overall.loc['CLAHE_UM', 'mean_cii']:.4f} ± {overall.loc['CLAHE_UM', 'std_cii']:.4f} |
+| Method | Number of Images | Mean PSNR (dB) | Mean SSIM | Mean Entropy (bits) | Mean CII (ROI-based) | Mean CII (Patch-based) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Adaptive Median (Baseline)** | {overall.loc['Adaptive_Median', 'num_images'] if 'Adaptive_Median' in overall.index else 0} | Reference (N/A) | {overall.loc['Adaptive_Median', 'mean_ssim']:.4f} | {overall.loc['Adaptive_Median', 'mean_entropy']:.4f} | 1.0000 | 1.0000 |
+| **Global HE (Baseline)** | {overall.loc['HE', 'num_images'] if 'HE' in overall.index else 0} | {overall.loc['HE', 'mean_psnr']:.2f} ± {overall.loc['HE', 'std_psnr']:.2f} | {overall.loc['HE', 'mean_ssim']:.4f} ± {overall.loc['HE', 'std_ssim']:.4f} | {overall.loc['HE', 'mean_entropy']:.4f} ± {overall.loc['HE', 'std_entropy']:.4f} | {overall.loc['HE', 'mean_cii_roi']:.4f} ± {overall.loc['HE', 'std_cii_roi']:.4f} | {overall.loc['HE', 'mean_cii_patch']:.4f} ± {overall.loc['HE', 'std_cii_patch']:.4f} |
+| **CLAHE (Primary)** | {overall.loc['CLAHE', 'num_images'] if 'CLAHE' in overall.index else 0} | {overall.loc['CLAHE', 'mean_psnr']:.2f} ± {overall.loc['CLAHE', 'std_psnr']:.2f} | {overall.loc['CLAHE', 'mean_ssim']:.4f} ± {overall.loc['CLAHE', 'std_ssim']:.4f} | {overall.loc['CLAHE', 'mean_entropy']:.4f} ± {overall.loc['CLAHE', 'std_entropy']:.4f} | {overall.loc['CLAHE', 'mean_cii_roi']:.4f} ± {overall.loc['CLAHE', 'std_cii_roi']:.4f} | {overall.loc['CLAHE', 'mean_cii_patch']:.4f} ± {overall.loc['CLAHE', 'std_cii_patch']:.4f} |
+| **CLAHE + UM (Final)** | {overall.loc['CLAHE_UM', 'num_images'] if 'CLAHE_UM' in overall.index else 0} | {overall.loc['CLAHE_UM', 'mean_psnr']:.2f} ± {overall.loc['CLAHE_UM', 'std_psnr']:.2f} | {overall.loc['CLAHE_UM', 'mean_ssim']:.4f} ± {overall.loc['CLAHE_UM', 'std_ssim']:.4f} | {overall.loc['CLAHE_UM', 'mean_entropy']:.4f} ± {overall.loc['CLAHE_UM', 'std_entropy']:.4f} | {overall.loc['CLAHE_UM', 'mean_cii_roi']:.4f} ± {overall.loc['CLAHE_UM', 'std_cii_roi']:.4f} | {overall.loc['CLAHE_UM', 'mean_cii_patch']:.4f} ± {overall.loc['CLAHE_UM', 'std_cii_patch']:.4f} |
 
 ## 6. Key Findings & Observations
 1. **Global HE vs. CLAHE**:

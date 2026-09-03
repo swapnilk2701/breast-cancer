@@ -170,24 +170,52 @@ def run_pipeline(config_path="config/config.yaml", max_images=None):
     all_results_df.to_excel(excel_path, index=False)
     print(f"Raw results saved to:\n  - {csv_path}\n  - {excel_path}")
     
-    # Compute summary statistics
+    # Compute summary statistics (Mean ± Std Dev)
     summary_metrics = ['PSNR_Denoised_vs_Original', 'SSIM_Denoised_vs_Original', 'MSE_Denoised_vs_Original']
     if 'PSNR_Enhanced_vs_Original' in all_results_df.columns:
         summary_metrics.extend([
-            'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original', 'MSE_Enhanced_vs_Original',
-            'Enhanced_Entropy', 'Entropy_Delta', 'CII'
+            'PSNR_Enhanced_vs_Original', 'SSIM_Enhanced_vs_Original',
+            'CII_ROI', 'CII_Patch',
+            'Original_Entropy', 'Enhanced_Entropy', 'Entropy_Change_Pct',
+            'Original_SNR', 'SNR_Enhanced', 'SNR_Change_Pct',
+            'Original_CNR', 'CNR_Enhanced', 'CNR_Change_Pct'
         ])
 
     available_summary_metrics = [m for m in summary_metrics if m in all_results_df.columns]
-    summary_df = all_results_df.groupby(['Noise Type', 'Denoising Method'])[available_summary_metrics].mean().reset_index()
-    summary_df_sorted = summary_df.sort_values(by=['Noise Type', 'PSNR_Denoised_vs_Original'], ascending=[True, False])
-    
+
+    summary_list = []
+    grouped = all_results_df.groupby(['Noise Type', 'Denoising Method'])
+    for (n_type, d_method), group in grouped:
+        row = {'Noise Type': n_type, 'Denoising Method': d_method}
+        for m in available_summary_metrics:
+            m_mean = group[m].mean()
+            m_std = group[m].std() if len(group) > 1 else 0.0
+            row[f"{m}_Mean"] = float(m_mean)
+            row[f"{m}_Std"] = float(m_std)
+            row[f"{m}_Mean_Std"] = f"{m_mean:.4f} ± {m_std:.4f}"
+
+        # Status Indicators
+        if 'CII_ROI' in group:
+            row['CII_ROI_Status'] = 'Improved' if group['CII_ROI'].mean() > 1.0 else 'Degraded'
+        if 'CII_Patch' in group:
+            row['CII_Patch_Status'] = 'Improved' if group['CII_Patch'].mean() > 1.0 else 'Degraded'
+        if 'SNR_Change_Pct' in group:
+            row['SNR_Status'] = 'Improved' if group['SNR_Change_Pct'].mean() > 0 else 'Degraded'
+        if 'CNR_Change_Pct' in group:
+            row['CNR_Status'] = 'Improved' if group['CNR_Change_Pct'].mean() > 0 else 'Degraded'
+        if 'Entropy_Change_Pct' in group:
+            row['Entropy_Status'] = 'Improved' if group['Entropy_Change_Pct'].mean() > 0 else 'Degraded'
+
+        summary_list.append(row)
+
+    summary_df_sorted = pd.DataFrame(summary_list).sort_values(by=['Noise Type', 'PSNR_Denoised_vs_Original_Mean'], ascending=[True, False])
+
     summary_csv_path = os.path.join(results_dir, 'summary_statistics.csv')
     summary_excel_path = os.path.join(results_dir, 'summary_statistics.xlsx')
     summary_df_sorted.to_csv(summary_csv_path, index=False)
     summary_df_sorted.to_excel(summary_excel_path, index=False)
-    
-    print("\n--- Summary Statistics (Average Metrics) ---")
+
+    print("\n--- Summary Statistics (Dataset Level: Mean ± Std Dev & Status) ---")
     print(summary_df_sorted.to_string(index=False))
     print(f"\nSummary statistics saved to:\n  - {summary_csv_path}\n  - {summary_excel_path}")
     

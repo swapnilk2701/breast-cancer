@@ -15,7 +15,7 @@ from src.data_loader import get_image_paths, load_dataset_generator
 from src.model import add_noise, apply_denoising, apply_contrast_enhancement
 from src.pectoral_removal import PectoralMuscleRemover
 from src.intensity_normalization import IntensityNormalizer
-from src.contrast_sharpening.py import MammogramEnhancer
+from src.contrast_sharpening import MammogramEnhancer
 
 def run_pipeline(config_path="config/config.yaml", max_images=None):
     """

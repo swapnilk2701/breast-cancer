@@ -1,7 +1,7 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from src.contrast_sharpening.py import MammogramEnhancer
+from src.contrast_sharpening import MammogramEnhancer
 from src.pectoral_removal import PectoralMuscleRemover
 from src.intensity_normalization import IntensityNormalizer
 
